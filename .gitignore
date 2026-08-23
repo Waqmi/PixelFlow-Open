@@ -1,0 +1,15 @@
+# Local build artifacts and caches
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+.venv-catalina/
+.venv-windows/
+models/*.onnx
+.pyinstaller-cache-*/
+/*.spec
+build/PixelFlow-*/
+build/generated-specs/
+dist/
+build/*/dist/
+build/*/build/

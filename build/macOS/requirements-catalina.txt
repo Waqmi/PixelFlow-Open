@@ -1,0 +1,6 @@
+# Build this environment on an Intel Mac that can run macOS 10.15.
+# Qt 6.10 in the regular build targets macOS 11+, so Catalina uses a
+# separately pinned Qt/PySide runtime.
+Pillow==10.4.0
+PySide6_Essentials==6.3.2
+PyInstaller==5.13.2

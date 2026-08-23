@@ -1,0 +1,37 @@
+name: Build Windows x64
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "**.py"
+      - "resources/**"
+      - "build/windows/**"
+      - "requirements.txt"
+      - ".github/workflows/build-windows.yml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: "x64"
+
+      - name: Build PixelFlow for Windows
+        shell: cmd
+        run: build\windows\build_windows.bat
+
+      - name: Upload Windows application
+        uses: actions/upload-artifact@v4
+        with:
+          name: PixelFlow-Windows-x64
+          path: dist/PixelFlow-Windows-x64.exe
+          if-no-files-found: error
+          retention-days: 30

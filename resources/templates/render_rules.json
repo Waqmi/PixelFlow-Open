@@ -1,0 +1,9 @@
+{
+  "background_extension": {
+    "enabled_for_opaque_main_product": true,
+    "edge_sample_ratio": 0.04,
+    "blend_ratio": 0.03,
+    "use_corner_gradient": true,
+    "protect_light_products": true
+  }
+}

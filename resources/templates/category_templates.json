@@ -1,0 +1,66 @@
+{
+  "shirt": {
+    "sizes": {
+      "1440x1440": {"scale": 0.765, "position_x": 0.500, "position_y": 0.500},
+      "1440x1920": {"scale": 0.685, "position_x": 0.500, "position_y": 0.500},
+      "1125x1500": {"scale": 0.734, "position_x": 0.500, "position_y": 0.500}
+    }
+  },
+  "pants": {
+    "sizes": {
+      "1440x1440": {"scale": 0.766, "position_x": 0.500, "position_y": 0.502},
+      "1440x1920": {"scale": 0.748, "position_x": 0.500, "position_y": 0.500},
+      "1125x1500": {"scale": 0.745, "position_x": 0.500, "position_y": 0.499}
+    }
+  },
+  "long_pants": {
+    "sizes": {
+      "1440x1440": {"scale": 0.766, "position_x": 0.500, "position_y": 0.502},
+      "1440x1920": {"scale": 0.748, "position_x": 0.500, "position_y": 0.500},
+      "1125x1500": {"scale": 0.745, "position_x": 0.500, "position_y": 0.499}
+    }
+  },
+  "shorts": {
+    "sizes": {
+      "1440x1440": {"scale": 0.633, "position_x": 0.500, "position_y": 0.500},
+      "1440x1920": {"scale": 0.581, "position_x": 0.500, "position_y": 0.500},
+      "1125x1500": {"scale": 0.590, "position_x": 0.500, "position_y": 0.500}
+    }
+  },
+  "shoes": {
+    "sizes": {
+      "1440x1440": {"scale": 0.758, "position_x": 0.516, "position_y": 0.518},
+      "1440x1920": {"scale": 0.790, "position_x": 0.517, "position_y": 0.535},
+      "1125x1500": {"scale": 0.840, "position_x": 0.519, "position_y": 0.527}
+    }
+  },
+  "accessories": {
+    "sizes": {
+      "1440x1440": {"scale": 0.699, "position_x": 0.500, "position_y": 0.500},
+      "1440x1920": {"scale": 0.699, "position_x": 0.493, "position_y": 0.500},
+      "1125x1500": {"scale": 0.760, "position_x": 0.501, "position_y": 0.500}
+    }
+  },
+  "hat": {
+    "sizes": {
+      "1440x1440": {"scale": 0.699, "position_x": 0.500, "position_y": 0.500},
+      "1440x1920": {"scale": 0.699, "position_x": 0.493, "position_y": 0.500},
+      "1125x1500": {"scale": 0.760, "position_x": 0.501, "position_y": 0.500}
+    }
+  },
+  "socks": {
+    "scale": 0.550,
+    "position_x": 0.500,
+    "position_y": 0.520
+  },
+  "bag": {
+    "scale": 0.600,
+    "position_x": 0.500,
+    "position_y": 0.500
+  },
+  "other": {
+    "scale": 0.750,
+    "position_x": 0.500,
+    "position_y": 0.500
+  }
+}

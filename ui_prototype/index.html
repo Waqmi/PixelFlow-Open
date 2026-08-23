@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PixelFlow UI Prototype</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="app-shell">
+    <header class="topbar">
+      <div class="brand-lockup">
+        <div class="brand-mark">PF</div>
+        <div>
+          <h1>PixelFlow</h1>
+          <p>自动化商品主图工作台</p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <span class="version-chip">UI Prototype · v2</span>
+        <button class="icon-button" data-modal="settings-modal" title="设置" aria-label="设置">⚙</button>
+      </div>
+    </header>
+
+    <section class="workspace">
+      <div class="main-column">
+        <section class="panel intro-panel">
+          <div>
+            <span class="eyebrow">AUTOMATION FIRST</span>
+            <h2>让素材自己走完大部分流程</h2>
+            <p>选择素材后，PixelFlow 会自动识别商品图、细节图与模特图；只有低置信度项目需要你确认。</p>
+          </div>
+          <div class="automation-orbit" aria-label="自动化流程示意">
+            <span class="orbit-dot dot-one"></span><span class="orbit-dot dot-two"></span>
+            <strong>自动<br>识别</strong>
+          </div>
+        </section>
+
+        <section class="panel source-panel">
+          <div class="section-heading">
+            <div><span class="eyebrow">01 / SOURCE</span><h3>素材与输出</h3></div>
+            <span class="ready-badge"><i></i>准备就绪</span>
+          </div>
+          <div class="path-grid">
+            <label class="path-field">
+              <span>商品素材文件夹</span>
+              <div class="field-row"><input id="source-path" placeholder="选择包含颜色 / 款式子文件夹的位置"><button class="secondary-button choose-button" data-target="source-path">选择</button></div>
+            </label>
+            <label class="path-field">
+              <span>输出位置</span>
+              <div class="field-row"><input id="output-path" placeholder="生成后的主图与卖点图保存到哪里"><button class="secondary-button choose-button" data-target="output-path">选择</button></div>
+            </label>
+          </div>
+        </section>
+
+        <section class="panel options-panel">
+          <div class="section-heading compact-heading">
+            <div><span class="eyebrow">02 / OUTPUT</span><h3>输出规格</h3></div>
+            <span class="muted-label">商品图与模特图共用</span>
+          </div>
+          <div class="size-grid">
+            <button class="size-card selected" data-size-card><span class="checkmark">✓</span><strong>1440×1440</strong><small>1 : 1 · 方图</small></button>
+            <button class="size-card selected" data-size-card><span class="checkmark">✓</span><strong>1440×1920</strong><small>3 : 4 · 竖图</small></button>
+            <button class="size-card selected" data-size-card><span class="checkmark">✓</span><strong>1125×1500</strong><small>3 : 4 · 轻量竖图</small></button>
+          </div>
+        </section>
+
+        <section class="panel generation-panel">
+          <div class="section-heading compact-heading">
+            <div><span class="eyebrow">03 / AUTOMATION</span><h3>生成内容</h3></div>
+            <span class="muted-label">默认自动处理</span>
+          </div>
+          <div class="toggle-grid">
+            <button class="toggle-card active" data-toggle-card><span><b>Logo</b><small>按画面明暗自动选择 Logo</small></span><i class="toggle"><em></em></i></button>
+            <button class="toggle-card active" data-toggle-card><span><b>唯品专享图</b><small>从无 Logo 方图自动生成</small></span><i class="toggle"><em></em></i></button>
+            <button class="toggle-card active" data-toggle-card><span><b>自动识别素材类型</b><small>商品白底图 / 细节图 / 模特图</small></span><i class="toggle"><em></em></i></button>
+            <button class="toggle-card active" data-toggle-card><span><b>自动生成模特主图</b><small>人物安全构图，不套商品比例</small></span><i class="toggle"><em></em></i></button>
+            <button class="toggle-card active" data-toggle-card><span><b>自动生成卖点图</b><small>从细节图匹配已配置卖点</small></span><i class="toggle"><em></em></i></button>
+            <button class="toggle-card feature-card" data-modal="selling-points-modal"><span><b>产品卖点</b><small><strong>已配置 5 个卖点</strong> · 透气、防滑、防磨…</small></span><span class="link-arrow">编辑卖点 <b>→</b></span></button>
+          </div>
+        </section>
+
+        <button class="advanced-trigger" data-advanced-trigger><span>高级设置</span><span class="chevron">⌄</span></button>
+        <section class="panel advanced-panel hidden" id="advanced-panel">
+          <div class="advanced-grid">
+            <label><span>商品品类</span><select><option>自动识别</option><option>袜子</option><option>鞋品</option><option>配件</option></select></label>
+            <label><span>商品比例模板</span><select><option>按品类自动匹配</option><option>保持原图</option></select></label>
+            <label><span>低置信度阈值</span><div class="range-value"><input type="range" min="50" max="95" value="75"><b>75%</b></div></label>
+            <label><span>最大文件大小</span><select><option>不限制</option><option>5 MB</option><option>10 MB</option></select></label>
+          </div>
+          <div class="advanced-flags"><span>模特图：自动人物构图 <b>ON</b></span><span>异常才确认 <b>ON</b></span><span>卖点图：自动选择版式 <b>ON</b></span></div>
+        </section>
+      </div>
+
+      <aside class="side-column">
+        <section class="panel review-panel">
+          <div class="review-kicker"><span class="warning-dot">!</span><span>待确认</span><strong id="review-count">3</strong></div>
+          <h3>少数异常，统一处理</h3>
+          <p>系统已自动处理大部分素材，有 3 张需要你快速确认。</p>
+          <div class="review-mini-list"><div><b>素材分类</b><span>1 张不确定</span></div><div><b>模特构图</b><span>1 张有风险</span></div><div><b>卖点匹配</b><span>1 张低置信度</span></div></div>
+          <button class="outline-button full-button" data-modal="review-modal">查看待确认 <span>→</span></button>
+        </section>
+        <section class="panel insight-panel">
+          <div class="insight-header"><span class="eyebrow">SIMULATED ANALYSIS</span><span class="pulse"></span></div>
+          <div class="analysis-number">25 <small>张素材</small></div>
+          <div class="stat-row"><span><i class="stat-swatch product"></i>商品白底图</span><b>8</b></div>
+          <div class="stat-row"><span><i class="stat-swatch detail"></i>细节图</span><b>9</b></div>
+          <div class="stat-row"><span><i class="stat-swatch model"></i>模特图</span><b>8</b></div>
+          <div class="model-breakdown"><span>模特构图</span><div><em>全身 3</em><em>半身 2</em><em>动作 2</em><em>多人 1</em></div></div>
+        </section>
+        <section class="panel status-panel">
+          <div class="status-line"><span class="status-led"></span><b id="status-title">准备就绪</b></div>
+          <p id="status-copy">选择素材文件夹后，开始自动识别。</p>
+          <div class="progress-wrap hidden" id="progress-wrap"><div class="progress-bar"><i id="progress-bar"></i></div><span id="progress-label">0%</span></div>
+          <button class="primary-button full-button" id="start-button"><span class="play-icon">▶</span> 开始生成</button>
+          <button class="stop-button hidden full-button" id="stop-button">停止生成</button>
+        </section>
+      </aside>
+    </section>
+  </main>
+
+  <div class="modal-backdrop hidden" id="modal-backdrop">
+    <div class="modal" id="modal" role="dialog" aria-modal="true">
+      <button class="modal-close" id="modal-close">×</button>
+      <div id="modal-content"></div>
+    </div>
+  </div>
+  <div class="toast" id="toast"></div>
+  <script src="app.js"></script>
+</body>
+</html>

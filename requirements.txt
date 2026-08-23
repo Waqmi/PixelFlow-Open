@@ -1,0 +1,5 @@
+Pillow
+PySide6_Essentials==6.10.3
+pyinstaller
+numpy==1.26.4
+onnxruntime==1.19.2
