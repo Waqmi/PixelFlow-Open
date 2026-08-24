@@ -47,6 +47,7 @@ from local_model_assistant import LocalModelAssistant, find_onnx_model
 APP_ICON_PATH = RESOURCE_ROOT / (
     "app-icon.icns" if sys.platform == "darwin" else "app-icon.ico"
 )
+SETTINGS_ICON_PATH = RESOURCE_ROOT / "settings-02-stroke-rounded.svg"
 
 LOGO_KEYS = (
     "logo_square_dark",
@@ -1181,11 +1182,13 @@ class MainImageTool(QWidget):
         heading.addWidget(subtitle)
         header.addWidget(heading_host, 0, Qt.AlignmentFlag.AlignVCenter)
         header.addStretch()
-        settings_button = QPushButton("⚙")
+        settings_button = QPushButton()
         settings_button.setObjectName("iconButton")
+        settings_button.setIcon(QIcon(str(SETTINGS_ICON_PATH)))
+        settings_button.setIconSize(QSize(20, 20))
         settings_button.setToolTip("设置")
         settings_button.setAccessibleName("设置")
-        settings_button.setFixedSize(48, 48)
+        settings_button.setFixedSize(40, 40)
         settings_button.clicked.connect(self._open_settings)
         header.addWidget(settings_button, 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addLayout(header)
@@ -1341,11 +1344,13 @@ class MainImageTool(QWidget):
         heading.addWidget(subtitle)
         header.addLayout(heading)
         header.addStretch()
-        settings_button = QPushButton("⚙")
+        settings_button = QPushButton()
         settings_button.setObjectName("iconButton")
+        settings_button.setIcon(QIcon(str(SETTINGS_ICON_PATH)))
+        settings_button.setIconSize(QSize(20, 20))
         settings_button.setToolTip("设置")
         settings_button.setAccessibleName("设置")
-        settings_button.setFixedSize(64, 64)
+        settings_button.setFixedSize(40, 40)
         settings_button.clicked.connect(self._open_settings)
         header.addWidget(settings_button, 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addLayout(header)
@@ -1686,7 +1691,7 @@ class MainImageTool(QWidget):
             QPushButton#mainStartButton:disabled {{ background: #6d91c5; border-color: #6d91c5; color: #dce8f8; }}
             QDialog QPushButton#startButton {{ background: {colors['settings_action']}; border-color: {colors['settings_action']}; font-size: 13px; padding: 9px 18px; border-radius: 8px; }}
             QDialog QPushButton#startButton:hover {{ background: {colors['settings_action_hover']}; border-color: {colors['settings_action_hover']}; }}
-            QPushButton#iconButton {{ padding: 0; font-size: 28px; font-weight: 600; border-radius: 15px; }}
+            QPushButton#iconButton {{ padding: 0; border-radius: 11px; }}
             QPushButton#iconButton:hover {{ background: #eef1f5; border-color: #d9e0e8; color: #4d5968; }}
             QPushButton#subtleButton {{ padding: 6px 10px; color: #365f86; background: transparent; border-color: transparent; }}
             QPushButton#subtleButton:hover {{ background: #eef5fb; border-color: #b9d2e8; }}
