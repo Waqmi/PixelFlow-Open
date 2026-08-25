@@ -955,6 +955,7 @@ class V15SettingsDialog(_LegacyV15SettingsDialog):
             ("素材目录", "支持图片直接放在根目录，也支持按颜色或款式放在子文件夹中；支持 JPG、JPEG、PNG。建议同一商品的图片放在同一文件夹，文件名尽量保留颜色或款式信息。"),
             ("使用技巧", "白底商品图适合生成普通主图；细节图可用于辅助判断；模特图请在文件名或文件夹名中标注“模特、上身、穿搭、model、lookbook”等关键词。Logo 请使用完整尺寸的 RGBA PNG，并按浅色背景/深色背景选择对应版本。文件命名建议使用简短模式，完整原名可在输出清单中追溯。"),
             ("功能边界", "模特图只做分类和安全构图放大，保留原图内容，不凭空生成新人物或新场景。本地 ONNX 模型只提供人物位置和构图建议，无法使用时自动回退规则模式；未启用远程辅助时无需 API Key，图片处理在本机完成。"),
+            ("最新版本", '<a href="https://github.com/Waqmi/PixelFlow-Open/releases">https://github.com/Waqmi/PixelFlow-Open/releases</a>（点击查看和下载最新发布版本）'),
         ):
             row = QFrame()
             row.setObjectName("settingsRow")
@@ -967,6 +968,9 @@ class V15SettingsDialog(_LegacyV15SettingsDialog):
             value = QLabel(value_text)
             value.setObjectName("settingsAboutValue")
             value.setWordWrap(True)
+            if title_text == "最新版本":
+                value.setOpenExternalLinks(True)
+                value.setToolTip("打开 PixelFlow GitHub 发布页")
             row_layout.addWidget(label)
             row_layout.addWidget(value, 1)
             layout.addWidget(row)
