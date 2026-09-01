@@ -19,8 +19,6 @@ EXCLUDES = [
     "PySide6.QtQuick",
     "PySide6.QtQuickControls2",
     "PySide6.QtQuickWidgets",
-    "PySide6.QtSvg",
-    "PySide6.QtSvgWidgets",
     "PySide6.QtMultimedia",
     "PySide6.QtMultimediaWidgets",
 ]
