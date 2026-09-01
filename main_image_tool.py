@@ -6,11 +6,13 @@ import shutil
 import sys
 import threading
 import traceback
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QSettings, QTimer, QUrl, QSize, Qt
-from PySide6.QtGui import QDesktopServices, QIcon, QImageReader, QPalette, QPixmap
+from PySide6.QtCore import QByteArray, QEasingCurve, QEvent, QPropertyAnimation, QSettings, QTimer, QUrl, QSize, Qt
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QImageReader, QPainter, QPalette, QPixmap
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -39,9 +41,65 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+
+class _MaterialClassificationCancelled(RuntimeError):
+    """Internal signal used to leave synchronous material classification."""
+
+
+class FolderDropLineEdit(QLineEdit):
+    """Line edit that accepts a material folder or image files from Finder."""
+
+    _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+
+    def __init__(self, on_folder_dropped, parent=None):
+        super().__init__(parent)
+        self._on_folder_dropped = on_folder_dropped
+        self.setAcceptDrops(True)
+
+    @classmethod
+    def _resolve_material_folder(cls, urls) -> Path | None:
+        """Resolve Finder URLs to one material folder without guessing across folders."""
+        paths = [Path(url.toLocalFile()) for url in urls if url.isLocalFile()]
+        if not paths or len(paths) != len(urls):
+            return None
+        if len(paths) == 1 and paths[0].is_dir():
+            return paths[0]
+        if not all(path.is_file() and path.suffix.lower() in cls._IMAGE_EXTENSIONS for path in paths):
+            return None
+        parents = {path.parent for path in paths}
+        return parents.pop() if len(parents) == 1 else None
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt API
+        mime = event.mimeData()
+        urls = mime.urls() if mime.hasUrls() else []
+        if urls and all(url.isLocalFile() for url in urls):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt API
+        mime = event.mimeData()
+        urls = mime.urls() if mime.hasUrls() else []
+        product_root = self._resolve_material_folder(urls)
+        if product_root is None:
+            QMessageBox.information(
+                self,
+                "无法识别拖入素材",
+                "请拖入一个素材文件夹，或拖入同一文件夹内的 JPG、JPEG、PNG 图片。",
+            )
+            event.ignore()
+            return
+        self._on_folder_dropped(product_root)
+        event.acceptProposedAction()
+
 from image_engine_api import RESOURCE_ROOT, SIZES, generate_images
 from category_engine import CategoryTemplateManager, RuleCategoryClassifier, RuleSourceTypeClassifier, SourceTypeDecision
-from local_model_assistant import LocalModelAssistant, find_onnx_model
+from local_model_assistant import (
+    LocalModelAssistant,
+    category_compatibility,
+    credible_model_composition,
+    find_onnx_model,
+)
 
 
 APP_ICON_PATH = RESOURCE_ROOT / (
@@ -61,6 +119,19 @@ DEFAULT_LOGO_FILES = {
     "logo_tall_dark": "新logo 1920.png",
     "logo_tall_light": "新logo 1920 2.png",
 }
+
+
+def _settings_icon(dark: bool) -> QIcon:
+    """Render the supplied SVG while resolving its theme-dependent color."""
+    color = "#eef2f7" if dark else "#3f4b59"
+    svg = SETTINGS_ICON_PATH.read_text(encoding="utf-8").replace("currentColor", color)
+    pixmap = QPixmap(24, 24)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+    renderer.render(painter)
+    painter.end()
+    return QIcon(pixmap)
 
 
 def _user_data_dir() -> Path:
@@ -1111,7 +1182,8 @@ class MainImageTool(QWidget):
         self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
         self.resize(1120, 820)
         self.setMinimumSize(900, 740)
-        self.product_root = QLineEdit()
+        self.product_root = FolderDropLineEdit(self._set_product_root_from_drop)
+        self.product_root.setPlaceholderText("可点击选择，或拖入素材文件夹 / 图片")
         self.output_root = QLineEdit()
         self.size_checks = {name: QCheckBox(name) for name in SIZES}
         self.logo_check = QCheckBox("生成含 Logo / 无 Logo")
@@ -1133,8 +1205,10 @@ class MainImageTool(QWidget):
         self.cancel_button = QPushButton("停止")
         self.cancel_button.setEnabled(False)
         self._job_running = False
+        self._last_run_arguments: tuple[object, ...] | None = None
         self.cancel_event = threading.Event()
         self.settings = QSettings("PixelFlow", "PixelFlow")
+        self._settings_buttons: list[QPushButton] = []
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
@@ -1188,12 +1262,13 @@ class MainImageTool(QWidget):
         header.addStretch()
         settings_button = QPushButton()
         settings_button.setObjectName("iconButton")
-        settings_button.setIcon(QIcon(str(SETTINGS_ICON_PATH)))
+        settings_button.setIcon(_settings_icon(self._system_uses_dark_mode()))
         settings_button.setIconSize(QSize(20, 20))
         settings_button.setToolTip("设置")
         settings_button.setAccessibleName("设置")
         settings_button.setFixedSize(40, 40)
         settings_button.clicked.connect(self._open_settings)
+        self._settings_buttons.append(settings_button)
         header.addWidget(settings_button, 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addLayout(header)
 
@@ -1350,12 +1425,13 @@ class MainImageTool(QWidget):
         header.addStretch()
         settings_button = QPushButton()
         settings_button.setObjectName("iconButton")
-        settings_button.setIcon(QIcon(str(SETTINGS_ICON_PATH)))
+        settings_button.setIcon(_settings_icon(self._system_uses_dark_mode()))
         settings_button.setIconSize(QSize(20, 20))
         settings_button.setToolTip("设置")
         settings_button.setAccessibleName("设置")
         settings_button.setFixedSize(40, 40)
         settings_button.clicked.connect(self._open_settings)
+        self._settings_buttons.append(settings_button)
         header.addWidget(settings_button, 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addLayout(header)
 
@@ -1695,8 +1771,27 @@ class MainImageTool(QWidget):
             QPushButton#mainStartButton:disabled {{ background: #6d91c5; border-color: #6d91c5; color: #dce8f8; }}
             QDialog QPushButton#startButton {{ background: {colors['settings_action']}; border-color: {colors['settings_action']}; font-size: 13px; padding: 9px 18px; border-radius: 8px; }}
             QDialog QPushButton#startButton:hover {{ background: {colors['settings_action_hover']}; border-color: {colors['settings_action_hover']}; }}
-            QPushButton#iconButton {{ padding: 0; border-radius: 11px; }}
-            QPushButton#iconButton:hover {{ background: #eef1f5; border-color: #d9e0e8; color: #4d5968; }}
+            QDialog#resultDialog {{ background: {colors['window']}; font-family: "PingFang SC"; }}
+            QDialog#resultDialog QLabel, QDialog#resultDialog QPushButton {{ font-family: "PingFang SC"; }}
+            QFrame#resultHeader, QFrame#resultInfoCard {{ background: {colors['panel']}; border: 1px solid {colors['border']}; border-radius: 16px; }}
+            QLabel#resultEyebrow {{ color: #347ff0; font-size: 11px; font-weight: 800; letter-spacing: 1.2px; }}
+            QLabel#resultTitle {{ color: {colors['title']}; font-size: 24px; font-weight: 700; }}
+            QLabel#resultDescription {{ color: {colors['muted']}; font-size: 13px; }}
+            QFrame#resultStatCard {{ background: {colors['card']}; border: 1px solid {colors['border']}; border-radius: 12px; }}
+            QFrame#resultStatCard:hover {{ border-color: {colors['selected_border']}; }}
+            QFrame#resultShortcutBar {{ background: transparent; border: none; }}
+            QLabel#resultStatValue {{ font-size: 24px; font-weight: 750; }}
+            QLabel#resultStatLabel {{ color: {colors['muted']}; font-size: 12px; font-weight: 600; }}
+            QLabel#resultInfoLabel {{ color: {colors['muted']}; font-size: 11px; }}
+            QLabel#resultInfoValue {{ color: {colors['text']}; font-size: 12px; font-weight: 600; }}
+            QPushButton#resultSecondaryButton {{ min-height: 36px; padding: 7px 14px; color: {colors['text']}; background: {colors['card']}; border: 1px solid {colors['field_border']}; border-radius: 9px; font-size: 12px; font-weight: 600; }}
+            QPushButton#resultSecondaryButton:hover {{ background: {colors['button_hover']}; border-color: {colors['selected_border']}; }}
+            QPushButton#resultPrimaryButton {{ min-height: 0px; max-height: 52px; padding: 8px 18px; color: #ffffff; background: #347ff0; border: 1px solid #347ff0; border-radius: 9px; font-size: 13px; font-weight: 700; }}
+            QPushButton#resultPrimaryButton:hover {{ background: #216bdd; border-color: #216bdd; }}
+            QPushButton#resultDangerButton {{ min-height: 36px; padding: 7px 14px; color: #c24848; background: transparent; border: 1px solid #d98b8b; border-radius: 9px; font-size: 12px; font-weight: 600; }}
+            QPushButton#resultDangerButton:hover {{ background: {colors['button_hover']}; border-color: #c24848; }}
+            QPushButton#iconButton {{ padding: 0; border-radius: 11px; color: {colors['text']}; }}
+            QPushButton#iconButton:hover {{ background: {colors['button_hover']}; border-color: {colors['field_border']}; color: {colors['text']}; }}
             QPushButton#subtleButton {{ padding: 6px 10px; color: #365f86; background: transparent; border-color: transparent; }}
             QPushButton#subtleButton:hover {{ background: #eef5fb; border-color: #b9d2e8; }}
             QPushButton#settingsBackButton {{ padding: 0; color: {colors['muted']}; background: {colors['panel']}; border: 1px solid {colors['border']}; border-radius: 12px; font-size: 26px; }}
@@ -1751,6 +1846,9 @@ class MainImageTool(QWidget):
             QToolTip {{ background: {colors['panel']}; color: {colors['text']}; border: 1px solid {colors['field_border']}; padding: 4px; }}
             """
         )
+        # Rebuild the glyph when the system palette changes at runtime.
+        for button in getattr(self, "_settings_buttons", []):
+            button.setIcon(_settings_icon(dark))
 
     def changeEvent(self, event: QEvent) -> None:
         if event.type() == QEvent.Type.ApplicationPaletteChange:
@@ -1790,6 +1888,15 @@ class MainImageTool(QWidget):
             output_name = product_root.name if product_root.name.endswith("主图") else f"{product_root.name}主图"
             self.output_root.setText(str(product_root.parent / output_name))
 
+    def _set_product_root_from_drop(self, product_root: Path) -> None:
+        """Apply a dropped material folder and suggest a matching output folder."""
+        if not self._has_material_sources(product_root):
+            QMessageBox.warning(self, "没有图片素材", "拖入的文件夹内没有 JPG、JPEG 或 PNG 图片。")
+            return
+        self.product_root.setText(str(product_root))
+        output_name = product_root.name if product_root.name.endswith("主图") else f"{product_root.name}主图"
+        self.output_root.setText(str(product_root.parent / output_name))
+
     def _choose_output_root(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "选择输出文件夹")
         if path:
@@ -1797,24 +1904,7 @@ class MainImageTool(QWidget):
 
     @staticmethod
     def _has_material_sources(product_root: Path) -> bool:
-        if not product_root.is_dir():
-            return False
-        try:
-            entries = tuple(product_root.iterdir())
-            return any(
-                item.is_file() and item.suffix.lower() in {".jpg", ".jpeg", ".png"}
-                for item in entries
-            ) or any(
-                child.is_dir()
-                and not child.name.startswith(".")
-                and any(
-                    item.is_file() and item.suffix.lower() in {".jpg", ".jpeg", ".png"}
-                    for item in child.iterdir()
-                )
-                for child in entries
-            )
-        except OSError:
-            return False
+        return bool(MainImageTool._material_sources(product_root))
 
     def _refresh_start_button(self) -> None:
         product_root = Path(self.product_root.text().strip())
@@ -1912,6 +2002,79 @@ class MainImageTool(QWidget):
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(output_root)))
 
+    @staticmethod
+    def _failure_report_text(failures: list[dict[str, str]]) -> str:
+        lines = ["PixelFlow 失败素材报告", ""]
+        for index, failure in enumerate(failures, start=1):
+            source = str(failure.get("source", "未知素材"))
+            code = str(failure.get("code", "unknown"))
+            message = str(failure.get("message", "未提供原因"))
+            lines.append(f"{index}. {source}")
+            lines.append(f"   类型：{code}")
+            lines.append(f"   原因：{message}")
+            lines.append("")
+        return "\n".join(lines)
+
+    def _copy_failure_report(self, failures: list[dict[str, str]]) -> None:
+        QApplication.clipboard().setText(self._failure_report_text(failures))
+        self._set_task_status("已复制失败清单", f"已复制 {len(failures)} 项失败素材信息。")
+
+    def _export_failure_report(self, failures: list[dict[str, str]]) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出失败报告",
+            "PixelFlow-失败素材.txt",
+            "文本文件 (*.txt)",
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(self._failure_report_text(failures), encoding="utf-8")
+        except OSError as error:
+            QMessageBox.warning(self, "导出失败报告失败", str(error))
+            return
+        self._set_task_status("报告已导出", f"失败素材报告已保存到：{path}")
+
+    def _retry_failures(self, failures: list[dict[str, str]]) -> None:
+        """Retry only failed input sources from the most recent batch."""
+        if self._job_running:
+            QMessageBox.information(self, "任务仍在运行", "当前任务尚未结束，请稍后再试。")
+            return
+        if not self._last_run_arguments:
+            QMessageBox.warning(self, "无法重试", "没有可用的上一次任务记录。")
+            return
+        product_root = Path(str(self._last_run_arguments[0]))
+        source_paths: set[str] = set()
+        for failure in failures:
+            candidate = Path(str(failure.get("retry_source") or failure.get("source", "")))
+            try:
+                candidate.relative_to(product_root)
+            except ValueError:
+                continue
+            if candidate.is_file():
+                source_paths.add(str(candidate))
+        if not source_paths:
+            QMessageBox.warning(
+                self,
+                "无法重试",
+                "失败项中没有可定位到原素材的文件，可能是输出阶段失败。",
+            )
+            return
+        self.cancel_event.clear()
+        self._job_running = True
+        self.start_button.setEnabled(False)
+        self.cancel_button.setVisible(True)
+        self.cancel_button.setEnabled(True)
+        self.progress.setVisible(True)
+        self.progress.setRange(0, max(1, len(source_paths)))
+        self.progress.setValue(0)
+        self._set_task_status("重试失败项", f"准备重新处理 {len(source_paths)} 张素材……")
+        threading.Thread(
+            target=self._run,
+            args=(*self._last_run_arguments, source_paths),
+            daemon=True,
+        ).start()
+
     def _show_failures_dialog(self, failures: list[dict[str, str]]) -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle(f"失败素材 · {len(failures)} 项")
@@ -1924,18 +2087,19 @@ class MainImageTool(QWidget):
         detail = QLabel("以下素材未能输出；其余成功结果不受影响。可根据文件名定位后重新生成。")
         detail.setObjectName("settingsDescription")
         detail.setWordWrap(True)
-        entries = []
-        for failure in failures:
-            source = Path(str(failure.get("source", "未知素材")))
-            message = str(failure.get("message", "未提供原因"))
-            entries.append(f"{source.name}\n{message}")
         listing = QTextEdit(dialog)
         listing.setReadOnly(True)
-        listing.setPlainText("\n\n".join(entries))
+        listing.setPlainText(self._failure_report_text(failures))
         close = QPushButton("关闭", dialog)
         close.setObjectName("startButton")
         close.clicked.connect(dialog.accept)
         button_row = QHBoxLayout()
+        copy = QPushButton("复制清单", dialog)
+        copy.clicked.connect(lambda: self._copy_failure_report(failures))
+        export = QPushButton("导出报告", dialog)
+        export.clicked.connect(lambda: self._export_failure_report(failures))
+        button_row.addWidget(copy)
+        button_row.addWidget(export)
         button_row.addStretch()
         button_row.addWidget(close)
         layout.addWidget(title)
@@ -1956,49 +2120,178 @@ class MainImageTool(QWidget):
             for key in ("main_images", "transparent_images", "vip_images", "selling_point_images")
         )
         skipped_count = int(result.get("skipped_model_sources", 0) or 0)
+        render_workers = int(result.get("render_workers", 1) or 1)
+        validation = result.get("validation", {})
+        validation_warnings = (
+            len(validation.get("warnings", []))
+            if isinstance(validation, dict)
+            else 0
+        )
         dialog = QDialog(self)
+        dialog.setObjectName("resultDialog")
         dialog.setWindowTitle("生成已停止" if cancelled else "生成完成")
-        dialog.setMinimumWidth(500)
+        # Keep the result window compact, but leave enough room for the
+        # reference layout's separate shortcut section and bottom actions.
+        # This intentionally does not copy the reference screenshot's size.
+        dialog.setFixedSize(860, 620)
         layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(24, 22, 24, 20)
-        layout.setSpacing(12)
-        title = QLabel("已安全停止" if cancelled else "生成完成")
-        title.setObjectName("settingsPageTitle")
+        layout.setContentsMargins(32, 26, 32, 26)
+        layout.setSpacing(14)
+
+        header = QFrame(dialog)
+        header.setObjectName("resultHeader")
+        header.setFixedHeight(126)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(22, 18, 22, 18)
+        header_layout.setSpacing(16)
+        status_mark = QLabel("✓" if not cancelled else "Ⅱ", header)
+        status_mark.setObjectName("resultStatusMark")
+        status_mark.setFixedSize(70, 70)
+        status_mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        status_mark.setStyleSheet(
+            "QLabel#resultStatusMark { background: #347ff0; color: #ffffff; border-radius: 35px; font-size: 31px; font-weight: 800; }"
+        )
+        header_layout.addWidget(status_mark)
+        title_column = QVBoxLayout()
+        title_column.setSpacing(4)
+        eyebrow = QLabel("PIXELFLOW · 批量任务", header)
+        eyebrow.setObjectName("resultEyebrow")
+        title = QLabel("已安全停止" if cancelled else "生成完成", header)
+        title.setObjectName("resultTitle")
         explanation = QLabel(
             "已保留已完成的输出；未开始的任务不会继续处理。"
             if cancelled
-            else "输出已整理完成，可直接打开文件夹检查结果。"
+            else "输出已整理完成，可直接打开文件夹检查结果。",
+            header,
         )
-        explanation.setObjectName("settingsDescription")
+        explanation.setObjectName("resultDescription")
         explanation.setWordWrap(True)
-        summary = QLabel(
-            f"成功输出：{success_count} 张\n"
-            f"跳过素材：{skipped_count} 张\n"
-            f"失败素材：{len(failures)} 张\n"
-            f"自动并发：{int(result.get('render_workers', 1) or 1)}"
+        title_column.addWidget(eyebrow)
+        title_column.addWidget(title)
+        title_column.addWidget(explanation)
+        header_layout.addLayout(title_column, 1)
+
+        stats = QHBoxLayout()
+        stats.setSpacing(14)
+        stat_items = (
+            ("成功输出", success_count, "#2f8f5b"),
+            ("跳过素材", skipped_count, "#a06b1f"),
+            ("失败素材", len(failures), "#c24848"),
+            ("验收提醒", validation_warnings, "#6575a8"),
         )
-        summary.setObjectName("settingsRule")
-        summary.setWordWrap(True)
-        location = QLabel(f"输出位置：{output_root}")
-        location.setObjectName("settingsDescription")
-        location.setWordWrap(True)
+        for label_text, value, color in stat_items:
+            card = QFrame(dialog)
+            card.setObjectName("resultStatCard")
+            card.setFixedHeight(100)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(20, 15, 20, 14)
+            value_label = QLabel(str(value), card)
+            value_label.setObjectName("resultStatValue")
+            value_label.setStyleSheet(f"color: {color};")
+            label = QLabel(label_text, card)
+            label.setObjectName("resultStatLabel")
+            card_layout.addWidget(value_label)
+            card_layout.addWidget(label)
+            stats.addWidget(card, 1)
+        info_card = QFrame(dialog)
+        info_card.setObjectName("resultInfoCard")
+        info_card.setFixedHeight(120)
+        info_layout = QGridLayout(info_card)
+        info_layout.setContentsMargins(24, 16, 24, 16)
+        info_layout.setHorizontalSpacing(18)
+        info_layout.setVerticalSpacing(13)
+        info_layout.setColumnStretch(0, 1)
+        info_layout.setColumnStretch(1, 1)
+        output_label = QLabel("输出位置", info_card)
+        output_label.setObjectName("resultInfoLabel")
+        location = QLabel(str(output_root), info_card)
+        location.setObjectName("resultInfoValue")
+        location.setWordWrap(False)
+        location.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        location.setToolTip(str(output_root))
+        info_layout.addWidget(output_label, 0, 0)
+        info_layout.addWidget(location, 0, 1)
+        worker_label = QLabel("处理并发", info_card)
+        worker_label.setObjectName("resultInfoLabel")
+        worker_value = QLabel(f"{render_workers} 个工作线程", info_card)
+        worker_value.setObjectName("resultInfoValue")
+        info_layout.addWidget(worker_label, 1, 0)
+        info_layout.addWidget(worker_value, 1, 1)
+        result_action_size = QSize(150, 52)
         open_button = QPushButton("打开输出文件夹", dialog)
+        open_button.setObjectName("resultPrimaryButton")
+        open_button.setFixedSize(result_action_size)
         open_button.clicked.connect(lambda: self._open_output_folder(output_root))
         failure_button = QPushButton(f"查看失败素材（{len(failures)}）", dialog)
+        failure_button.setObjectName("resultSecondaryButton")
         failure_button.setVisible(bool(failures))
         failure_button.clicked.connect(lambda: self._show_failures_dialog(failures))
+        retry_button = QPushButton(f"仅重试失败项（{len(failures)}）", dialog)
+        retry_button.setObjectName("resultDangerButton")
+        retry_button.setVisible(bool(failures))
+
+        def retry_failed_sources() -> None:
+            dialog.accept()
+            self._retry_failures(failures)
+
+        retry_button.clicked.connect(retry_failed_sources)
         close = QPushButton("完成", dialog)
-        close.setObjectName("startButton")
+        close.setObjectName("resultSecondaryButton")
+        close.setFixedSize(result_action_size)
         close.clicked.connect(dialog.accept)
+        shortcut_bar = QWidget(dialog)
+        shortcut_bar.setObjectName("resultShortcutBar")
+        shortcut_bar.setFixedHeight(96)
+        shortcut_section = QVBoxLayout(shortcut_bar)
+        shortcut_section.setContentsMargins(0, 0, 0, 0)
+        shortcut_section.setSpacing(10)
+        shortcut_title = QLabel("快捷打开", dialog)
+        shortcut_title.setObjectName("resultInfoLabel")
+        shortcut_title.setStyleSheet("font-size: 13px; font-weight: 700;")
+        shortcut_section.addWidget(shortcut_title)
+        shortcut_row = QHBoxLayout()
+        shortcut_row.setContentsMargins(0, 0, 0, 0)
+        shortcut_row.setSpacing(14)
+        shortcut_specs = (
+            ("主图", output_root),
+            ("模特图", output_root / "模特图"),
+            ("透明图", output_root / "透明产品图"),
+            ("唯品图", output_root / "唯品专享1440"),
+        )
+        for label, folder in shortcut_specs:
+            if folder.is_dir():
+                shortcut = QPushButton(label, dialog)
+                shortcut.setObjectName("resultSecondaryButton")
+                shortcut.setFixedSize(112, 60)
+                shortcut.clicked.connect(lambda _checked=False, path=folder: self._open_output_folder(path))
+                shortcut_row.addWidget(shortcut)
+        shortcut_row.addStretch()
+        shortcut_section.addLayout(shortcut_row)
         button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.setSpacing(12)
         button_row.addWidget(open_button)
         button_row.addWidget(failure_button)
+        button_row.addWidget(retry_button)
         button_row.addStretch()
         button_row.addWidget(close)
-        layout.addWidget(title)
-        layout.addWidget(explanation)
-        layout.addWidget(summary)
-        layout.addWidget(location)
+        button_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(header)
+        layout.addLayout(stats)
+        if result.get("incremental_skipped"):
+            cached_hint = QLabel("检测到素材和设置均未变化，本次已复用上次输出。", dialog)
+            cached_hint.setObjectName("resultInfoLabel")
+            info_layout.addWidget(cached_hint, 2, 0, 1, 2)
+        elif int(result.get("incremental_reused", 0) or 0) > 0:
+            reused_hint = QLabel(
+                f"本次复用 {int(result.get('incremental_reused', 0) or 0)} 张未变化素材，其余素材已重新生成。",
+                dialog,
+            )
+            reused_hint.setObjectName("resultInfoLabel")
+            info_layout.addWidget(reused_hint, 2, 0, 1, 2)
+        layout.addWidget(info_card)
+        layout.addWidget(shortcut_bar)
+        layout.addStretch(1)
         layout.addLayout(button_row)
         dialog.exec()
 
@@ -2019,8 +2312,25 @@ class MainImageTool(QWidget):
         if not selected_sizes:
             QMessageBox.warning(self, "缺少输出尺寸", "至少选择一个输出尺寸。")
             return
-        self._save_settings()
         output_root = Path(output_text)
+        preflight_warnings, preflight_blocking = self._preflight_materials(
+            product_root,
+            output_root,
+        )
+        if preflight_blocking:
+            QMessageBox.warning(self, "生成前检查未通过", "\n".join(preflight_blocking))
+            return
+        if preflight_warnings:
+            answer = QMessageBox.question(
+                self,
+                "生成前检查提醒",
+                "\n".join(preflight_warnings) + "\n\n仍要继续生成吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._save_settings()
         include_logo = self.logo_check.isChecked()
         include_vip = self.vip_check.isChecked()
         include_model_images = self.model_images_check.isChecked()
@@ -2038,27 +2348,40 @@ class MainImageTool(QWidget):
             enable_material_understanding or include_model_images
         )
         if needs_material_classification:
+            # Classification is synchronous on the GUI thread.  Keep the
+            # cancel control active before entering it; the classifier yields
+            # to Qt between files so this button can be handled there.
+            self.cancel_event.clear()
             self._job_running = True
             self.start_button.setEnabled(False)
+            self.cancel_button.setVisible(True)
+            self.cancel_button.setEnabled(True)
             self.progress.setVisible(True)
             self.progress.setRange(0, max(1, len(self._material_sources(product_root))))
             self.progress.setValue(0)
             self._set_task_status("识别分类", "正在识别素材类型……")
-        material_settings = (
-            self._confirm_material_types(
-                product_root,
-                category_override,
-                enable_category_template,
-                local_model_enabled,
-                local_model_path,
+        try:
+            material_settings = (
+                self._confirm_material_types(
+                    product_root,
+                    category_override,
+                    enable_category_template,
+                    local_model_enabled,
+                    local_model_path,
+                )
+                if needs_material_classification
+                else ({}, {}, set())
             )
-            if needs_material_classification
-            else ({}, {}, set())
-        )
+        except _MaterialClassificationCancelled:
+            material_settings = None
         if material_settings is None:
             self._job_running = False
             self.progress.setVisible(False)
-            self._set_task_status("准备就绪", "已取消素材确认，可调整选项后重新开始。")
+            self.cancel_button.setEnabled(False)
+            if self.cancel_event.is_set():
+                self._set_task_status("已安全停止", "素材识别已停止，未开始生成；可以调整选项后重新开始。")
+            else:
+                self._set_task_status("准备就绪", "已取消素材确认，可调整选项后重新开始。")
             self._refresh_start_button()
             return
         source_type_overrides, source_scale_adjustments, excluded_model_sources = material_settings
@@ -2072,27 +2395,29 @@ class MainImageTool(QWidget):
         self.progress.setVisible(True)
         self.progress.setValue(0)
         self._set_task_status("准备素材", "正在整理生成任务……")
+        run_arguments = (
+            product_root,
+            output_root,
+            selected_sizes,
+            include_logo,
+            include_vip,
+            max_size_mb,
+            category_override,
+            enable_category_template,
+            enable_material_understanding,
+            source_type_overrides,
+            source_scale_adjustments,
+            excluded_model_sources,
+            include_model_images,
+            logo_overrides,
+            naming_mode,
+            local_model_enabled,
+            local_model_path,
+        )
+        self._last_run_arguments = run_arguments
         threading.Thread(
             target=self._run,
-            args=(
-                product_root,
-                output_root,
-                selected_sizes,
-                include_logo,
-                include_vip,
-                max_size_mb,
-                category_override,
-                enable_category_template,
-                enable_material_understanding,
-                source_type_overrides,
-                source_scale_adjustments,
-                excluded_model_sources,
-                include_model_images,
-                logo_overrides,
-                naming_mode,
-                local_model_enabled,
-                local_model_path,
-            ),
+            args=run_arguments,
             daemon=True,
         ).start()
 
@@ -2115,6 +2440,7 @@ class MainImageTool(QWidget):
         naming_mode: str,
         local_model_enabled: bool,
         local_model_path: str,
+        source_filter: set[str] | None = None,
     ) -> None:
         try:
             result = generate_images(
@@ -2137,6 +2463,7 @@ class MainImageTool(QWidget):
                 naming_mode=naming_mode,
                 local_model_enabled=local_model_enabled,
                 local_model_path=local_model_path,
+                source_filter=source_filter,
                 progress=lambda completed, total, message: self.events.put(
                     ("progress", (completed, total, message))
                 ),
@@ -2149,27 +2476,67 @@ class MainImageTool(QWidget):
 
     @staticmethod
     def _material_sources(product_root: Path) -> tuple[Path, ...]:
-        try:
-            entries = tuple(sorted(product_root.iterdir()))
-        except OSError:
+        if not product_root.is_dir():
             return ()
-        material_dirs = []
-        if any(
-            entry.is_file() and entry.suffix.lower() in {".jpg", ".jpeg", ".png"}
-            for entry in entries
-        ):
-            material_dirs.append(product_root)
-        material_dirs.extend(
-            entry
-            for entry in entries
-            if entry.is_dir() and not entry.name.startswith(".")
-        )
-        return tuple(
-            source
-            for material_dir in material_dirs
-            for source in sorted(material_dir.iterdir())
-            if source.is_file() and source.suffix.lower() in {".jpg", ".jpeg", ".png"}
-        )
+        image_extensions = {".jpg", ".jpeg", ".png"}
+        sources: list[Path] = []
+
+        def collect(directory: Path) -> None:
+            try:
+                entries = tuple(sorted(directory.iterdir()))
+            except OSError:
+                return
+            sources.extend(
+                entry
+                for entry in entries
+                if entry.is_file() and entry.suffix.lower() in image_extensions
+            )
+            for entry in entries:
+                if entry.is_dir() and not entry.is_symlink() and not entry.name.startswith("."):
+                    collect(entry)
+
+        collect(product_root)
+        return tuple(sources)
+
+    @staticmethod
+    def _preflight_materials(
+        product_root: Path,
+        output_root: Path,
+    ) -> tuple[list[str], list[str]]:
+        """Run one batch-level preflight instead of interrupting per file."""
+        warnings: list[str] = []
+        blocking: list[str] = []
+        sources = MainImageTool._material_sources(product_root)
+        unreadable: list[str] = []
+        oversized: list[str] = []
+        for source in sources:
+            reader = QImageReader(str(source))
+            if not reader.canRead() or not reader.size().isValid():
+                unreadable.append(source.name)
+                continue
+            size = reader.size()
+            if size.width() * size.height() > 50_000_000:
+                oversized.append(source.name)
+        if unreadable:
+            warnings.append(f"无法读取 {len(unreadable)} 张图片（例如：{', '.join(unreadable[:3])}）。")
+        if oversized:
+            warnings.append(f"有 {len(oversized)} 张图片超过 5000 万像素，处理时可能占用较多内存。")
+
+        output_parent = output_root
+        if output_root.exists() and not output_root.is_dir():
+            blocking.append(f"输出位置不是文件夹：{output_root}")
+        while not output_parent.exists() and output_parent != output_parent.parent:
+            output_parent = output_parent.parent
+        if not output_parent.exists() or not os.access(output_parent, os.W_OK):
+            blocking.append(f"输出位置不可写：{output_root}")
+        else:
+            try:
+                free_bytes = shutil.disk_usage(output_parent).free
+                if free_bytes < 200 * 1024 * 1024:
+                    warnings.append("输出磁盘可用空间低于 200 MB，批量生成可能中途失败。")
+            except OSError:
+                pass
+        return warnings, blocking
 
     def _confirm_material_types(
         self,
@@ -2182,16 +2549,19 @@ class MainImageTool(QWidget):
         sources = self._material_sources(product_root)
         classifier = RuleSourceTypeClassifier()
         base_scale = None
+        selected_category = None
         if enable_category_template:
-            category = RuleCategoryClassifier().classify(
+            selected_category = RuleCategoryClassifier().classify(
                 product_root,
                 manual_category=category_override,
             ).category
             base_scale = CategoryTemplateManager(
                 RESOURCE_ROOT / "templates" / "category_templates.json"
-            ).get(category, "1440x1440").scale
+            ).get(selected_category, "1440x1440").scale
 
         def report_classification(completed, total, source, decision) -> None:
+            if self.cancel_event.is_set():
+                raise _MaterialClassificationCancelled
             self.progress.setRange(0, max(1, total))
             self.progress.setValue(completed)
             self._set_task_status(
@@ -2200,48 +2570,153 @@ class MainImageTool(QWidget):
                 f"{ {'main_product': '商品白底图', 'detail': '细节图', 'model': '模特图', 'model_detail': '模特图'}[decision.source_type] }"
             )
             QApplication.processEvents()
+            if self.cancel_event.is_set():
+                raise _MaterialClassificationCancelled
 
         decisions = classifier.classify_many(sources, progress=report_classification)
         # The confirmation UI intentionally has only three visible choices.
-        # When the local pose model sees a clothing-only/partial model shot,
+        # Run the optional pose model over every source, not only files that
+        # the colour/edge rules already called "model".  A saturated studio
+        # background makes the old edge heuristic report the whole frame as
+        # foreground, so it otherwise never reached the model correction path.
+        # When the pose model sees a clothing-only/partial model shot,
         # preserve it as ``model_detail`` internally but present it as the
         # existing "细节图" choice.  This keeps the review surface compact
         # while retaining the model-source behaviour (including Skip).
+        local_model = None
         if local_model_enabled:
-            model_sources = [
-                source for source in sources
-                if decisions[source].source_type == "model"
-            ]
             model_path = find_onnx_model(local_model_path)
-            if model_sources and model_path is not None:
+            if model_path is not None:
                 try:
                     local_model = LocalModelAssistant(model_path)
                 except Exception as error:  # noqa: BLE001 - preserve rule fallback
                     self._set_task_status("识别分类", f"本地模型不可用，已按规则继续：{error}")
-                else:
-                    self.progress.setRange(0, len(model_sources))
-                    self.progress.setValue(0)
-                    for index, source in enumerate(model_sources, start=1):
-                        try:
-                            composition = local_model.compose_for_sizes(source, SIZES)
-                            if composition.get("model_view") == "detail":
-                                decisions[source] = SourceTypeDecision(
-                                    "model_detail",
-                                    float(composition.get("confidence", 0.0)),
-                                    "local_onnx",
-                                    "本地模型识别为模特细节图，按细节图铺满处理",
-                                    metadata=composition,
-                                )
-                        except Exception:
-                            # A single photo failing inference must not block
-                            # review or silently change its original decision.
-                            pass
-                        self.progress.setValue(index)
-                        self._set_task_status(
-                            "识别分类",
-                            f"区分模特图与模特细节图 {index} / {len(model_sources)} · {source.name}",
+        if local_model is not None:
+            self.progress.setRange(0, len(sources))
+            self.progress.setValue(0)
+            for index, source in enumerate(sources, start=1):
+                if self.cancel_event.is_set():
+                    raise _MaterialClassificationCancelled
+                try:
+                    composition = local_model.compose_for_sizes(source, SIZES)
+                    model_view = composition.get("model_view")
+                    confidence = float(composition.get("confidence", 0.0))
+                    # A strong rule classification for a product cutout/photo
+                    # must not be overturned by a single-person pose false
+                    # positive (common on mannequin-shaped garments).  Keep
+                    # group detections eligible, since a real two-person shot
+                    # is unlikely to be a flat product image.
+                    rule_decision = decisions[source]
+                    can_promote_model = (
+                        rule_decision.source_type in {"model", "model_detail"}
+                        or model_view == "group"
+                    )
+                    credible_model = credible_model_composition(composition)
+                    if model_view in {"full_body", "upper_body", "lower_body", "group"} and can_promote_model and credible_model:
+                        decisions[source] = SourceTypeDecision(
+                            "model",
+                            confidence,
+                            "local_onnx",
+                            "本地模型检测到人物主体"
+                            + ("（多人）" if model_view == "group" else ""),
+                            metadata=composition,
                         )
-                        QApplication.processEvents()
+                    elif decisions[source].source_type == "model" and credible_model:
+                        decisions[source] = SourceTypeDecision(
+                            "model_detail",
+                            confidence,
+                            "local_onnx",
+                            "本地模型识别为模特细节图，按细节图铺满处理",
+                            metadata=composition,
+                        )
+                    elif (
+                        decisions[source].source_type == "detail"
+                        and can_promote_model
+                        and credible_model
+                        and int(composition.get("person_count", 0) or 0) > 0
+                        and int(
+                            (composition.get("body_visibility") or {}).get(
+                                "visible_keypoints", 0
+                            )
+                            if isinstance(composition.get("body_visibility"), dict)
+                            else 0
+                        )
+                        >= 4
+                    ):
+                        # Keep partial human shots available for category
+                        # compatibility checks (for example, a lower-body
+                        # image in a trousers batch) without treating them as
+                        # a zoomable full model portrait.
+                        decisions[source] = SourceTypeDecision(
+                            "model_detail",
+                            confidence,
+                            "local_onnx",
+                            "本地模型检测到局部人物主体，按细节图铺满处理",
+                            metadata=composition,
+                        )
+                    elif (
+                        decisions[source].source_type in {"model", "model_detail"}
+                        and decisions[source].source != "manual"
+                        and not credible_model
+                    ):
+                        # Folder names are only candidate evidence. Downgrade
+                        # weak single-person detections (often fabric/logo
+                        # close-ups) back to a normal detail image.
+                        decisions[source] = SourceTypeDecision(
+                            "detail",
+                            confidence,
+                            "local_onnx",
+                            "人体关键点/人物范围不足，按细节图处理",
+                            metadata=composition,
+                        )
+                    else:
+                        # Even when the pose model has too few landmarks to
+                        # promote a source to ``model_detail``, retain its
+                        # body-visibility evidence.  Category compatibility
+                        # (for example, shirt vs. lower-body-only photos)
+                        # must not depend on the display classification.
+                        decisions[source] = replace(
+                            decisions[source],
+                            metadata={**(decisions[source].metadata or {}), **composition},
+                        )
+                except Exception:
+                    # A single photo failing inference must not block review
+                    # or silently change its original rule decision.
+                    pass
+                self.progress.setValue(index)
+                self._set_task_status(
+                    "识别分类",
+                    f"区分模特图与模特细节图 {index} / {len(sources)} · {source.name}",
+                )
+                QApplication.processEvents()
+                if self.cancel_event.is_set():
+                    raise _MaterialClassificationCancelled
+        auto_excluded_sources: set[str] = set()
+        auto_excluded_reasons: dict[str, str] = {}
+        category_display_name = {
+            "shirt": "上衣",
+            "pants": "裤装",
+            "long_pants": "长裤",
+            "shorts": "短裤",
+            "shoes": "鞋",
+            "socks": "袜子",
+            "hat": "帽子",
+            "bag": "包",
+            "accessories": "配件",
+            "other": "其他",
+        }.get(selected_category or "", selected_category or "当前")
+        if selected_category:
+            for source, decision in decisions.items():
+                if not decision.metadata or not isinstance(
+                    decision.metadata.get("body_visibility"), dict
+                ):
+                    continue
+                visibility = decision.metadata.get("body_visibility") if decision.metadata else None
+                status, reason = category_compatibility(selected_category, visibility)
+                if status == "incompatible":
+                    key = str(source)
+                    auto_excluded_sources.add(key)
+                    auto_excluded_reasons[key] = reason
         dialog = QDialog(self)
         dialog.setWindowTitle(f"确认素材分类 · {len(sources)} 张")
         dialog.resize(1280, 780)
@@ -2335,7 +2810,14 @@ class MainImageTool(QWidget):
             # on every card, independent of the source name/folder length.
             card_layout.addSpacing(8)
             exclude_model_check = QCheckBox("不适用于本次品类（跳过）", card)
-            exclude_model_check.setToolTip("仅作用于模特素材；勾选后，此图片不会生成到模特图输出。")
+            auto_skip_reason = auto_excluded_reasons.get(str(source))
+            if auto_skip_reason:
+                exclude_model_check.setChecked(True)
+                exclude_model_check.setToolTip(
+                    f"已根据“{category_display_name}”品类自动勾选：{auto_skip_reason}。可手动取消。"
+                )
+            else:
+                exclude_model_check.setToolTip("仅作用于模特素材；勾选后，此图片不会生成到模特图输出。")
             card_layout.addWidget(exclude_model_check)
             scale_controls = QWidget(card)
             scale_layout = QVBoxLayout(scale_controls)

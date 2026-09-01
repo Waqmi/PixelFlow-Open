@@ -2,5 +2,7 @@
 # Qt 6.10 in the regular build targets macOS 11+, so Catalina uses a
 # separately pinned Qt/PySide runtime.
 Pillow==10.4.0
-PySide6_Essentials==6.3.2
+PySide6_Essentials==6.4.3
 PyInstaller==5.13.2
+# The x86_64 macOS wheel declares a 10.15 deployment target.
+onnxruntime==1.16.3

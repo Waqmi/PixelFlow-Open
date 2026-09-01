@@ -14,6 +14,7 @@ SOURCE_TYPE_IDS = ("main_product", "detail", "model", "model_detail")
 MODEL_KEYWORDS = (
     "model", "look", "lookbook", "onbody", "outfit", "wear",
     "模特", "上身", "上脚", "穿搭", "搭配", "实拍穿着", "街拍", "人像", "人物",
+    "双人", "多人", "合照", "合影", "情侣", "团体",
 )
 
 

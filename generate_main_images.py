@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from io import BytesIO
+import hashlib
 import json
 import os
 import re
@@ -15,10 +16,14 @@ from statistics import median
 from threading import Lock
 from typing import Callable
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageStat
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps, ImageStat
 
 from output_validator import ValidationIssue, validate_output
-from local_model_assistant import LocalModelAssistant, find_onnx_model
+from local_model_assistant import (
+    LocalModelAssistant,
+    credible_model_composition,
+    find_onnx_model,
+)
 
 from category_engine import (
     AICategoryProvider,
@@ -58,6 +63,11 @@ SIZES = {
     "1125x1500": ((1125, 1500), (239, 239, 239)),
 }
 
+# Bump whenever rendering logic changes; this invalidates old manifests.
+ENGINE_VERSION = "stable-24"
+
+MODEL_GROUP_NAMES = {"模特图", "模特细节图", "模特主图", "model", "lookbook"}
+
 TRANSPARENT_SIZES = {
     "800x800": (800, 800),
     "1440x1440": (1440, 1440),
@@ -90,18 +100,31 @@ SHORT_NAME_MAX_LENGTH = 18
 
 
 def _material_dirs(product_root: Path) -> tuple[Path, ...]:
-    """Accept both flat folders and the original color-subfolder layout."""
-    entries = tuple(sorted(product_root.iterdir()))
-    direct_images = any(
-        entry.is_file() and entry.suffix.lower() in IMAGE_EXTENSIONS
-        for entry in entries
-    )
-    child_dirs = tuple(
-        entry
-        for entry in entries
-        if entry.is_dir() and not entry.name.startswith(".")
-    )
-    return ((product_root,) if direct_images else ()) + child_dirs
+    """Return every folder that directly contains images.
+
+    Besides the original ``root/color/image`` layout, material roots may have
+    sibling groups such as ``root/model`` and ``root/product/color/image``.
+    Scanning only the first child level silently dropped the nested product
+    folders, so walk directories until each image-containing folder is found.
+    """
+    material_dirs: list[Path] = []
+
+    def collect(directory: Path) -> None:
+        try:
+            entries = tuple(sorted(directory.iterdir()))
+        except OSError:
+            return
+        if any(
+            entry.is_file() and entry.suffix.lower() in IMAGE_EXTENSIONS
+            for entry in entries
+        ):
+            material_dirs.append(directory)
+        for entry in entries:
+            if entry.is_dir() and not entry.is_symlink() and not entry.name.startswith("."):
+                collect(entry)
+
+    collect(product_root)
+    return tuple(material_dirs)
 
 
 def _auto_worker_count(source_count: int) -> int:
@@ -252,6 +275,107 @@ def resize_cover(image: Image.Image, size: tuple[int, int]) -> Image.Image:
     return resized.crop((left, top, left + size[0], top + size[1]))
 
 
+def model_background_extension_safe(
+    image: Image.Image,
+    size: tuple[int, int],
+    person_bboxes: list[tuple[float, float, float, float]] | None = None,
+) -> bool:
+    """Allow mirror extension only when the required side edges are clean.
+
+    This intentionally checks the two side strips row by row instead of using
+    the whole-image foreground box. The inspected strip is as wide as the
+    extension that would actually be needed; this catches arms or garments
+    near the edge even when they are symmetrically placed.
+    """
+    source = image.convert("RGB")
+    if not person_bboxes:
+        # Without a detector box, do not risk mirroring an unknown object.
+        return False
+    leftmost = min(float(box[0]) for box in person_bboxes)
+    rightmost = max(float(box[2]) for box in person_bboxes)
+    safety_margin = source.width * 0.01
+    if leftmost <= safety_margin or source.width - rightmost <= safety_margin:
+        return False
+
+    # Reject visibly textured edge strips. A clean wall, floor, or gentle
+    # lighting gradient can pass; a prop, foliage, text, or hard background
+    # detail should stay on the cover-crop path.
+    preview_width = min(256, source.width)
+    preview_height = max(1, round(source.height * preview_width / source.width))
+    preview = source.resize((preview_width, preview_height), Image.Resampling.BILINEAR)
+    strip = max(2, round(preview_width * 0.01))
+    noisy_rows = 0
+    for y in range(preview_height):
+        for start in (0, preview_width - strip):
+            pixels = [preview.getpixel((x, y)) for x in range(start, start + strip)]
+            channel_range = max(
+                max(pixel[channel] for pixel in pixels)
+                - min(pixel[channel] for pixel in pixels)
+                for channel in range(3)
+            )
+            if channel_range > 25:
+                noisy_rows += 1
+    return noisy_rows / max(1, preview_height * 2) <= 0.03
+
+
+def mirror_side_fill(
+    image: Image.Image,
+    size: tuple[int, int],
+    left: int,
+    top: int,
+    edge_source_widths: tuple[int, int] | None = None,
+) -> Image.Image:
+    """Fill uncovered canvas areas from the source image's edge pixels."""
+    canvas = Image.new("RGB", size)
+    right = left + image.width
+    bottom = top + image.height
+    if left >= 0:
+        extension_width = min(left, image.width)
+        source_width = min(
+            extension_width,
+            edge_source_widths[0] if edge_source_widths else extension_width,
+        )
+        if extension_width and source_width:
+            left_extension = image.crop((0, 0, source_width, image.height))
+            left_extension = ImageOps.mirror(left_extension).resize(
+                (extension_width, image.height), Image.Resampling.BILINEAR
+            )
+            canvas.paste(left_extension, (0, top))
+    if right <= size[0]:
+        extension_width = min(size[0] - right, image.width)
+        source_width = min(
+            extension_width,
+            edge_source_widths[1] if edge_source_widths else extension_width,
+        )
+        if extension_width and source_width:
+            right_extension = image.crop(
+                (image.width - source_width, 0, image.width, image.height)
+            )
+            right_extension = ImageOps.mirror(right_extension).resize(
+                (extension_width, image.height), Image.Resampling.BILINEAR
+            )
+            canvas.paste(right_extension, (right, top))
+    if top >= 0:
+        top_extension = image.crop((0, 0, image.width, min(top, image.height)))
+        if top_extension.height:
+            canvas.paste(ImageOps.flip(top_extension), (left, top - top_extension.height))
+    if bottom <= size[1]:
+        extension_height = min(size[1] - bottom, image.height)
+        if extension_height:
+            bottom_extension = image.crop((0, image.height - extension_height, image.width, image.height))
+            canvas.paste(ImageOps.flip(bottom_extension), (left, bottom))
+    paste_box = (max(0, left), max(0, top), min(size[0], right), min(size[1], bottom))
+    source_box = (
+        max(0, -left),
+        max(0, -top),
+        max(0, -left) + paste_box[2] - paste_box[0],
+        max(0, -top) + paste_box[3] - paste_box[1],
+    )
+    if paste_box[2] > paste_box[0] and paste_box[3] > paste_box[1]:
+        canvas.paste(image.crop(source_box), (paste_box[0], paste_box[1]))
+    return canvas
+
+
 def resize_model_preserve(
     image: Image.Image,
     size: tuple[int, int],
@@ -259,18 +383,56 @@ def resize_model_preserve(
     position_x: float = 0.5,
     position_y: float = 0.5,
     allow_mirror_extension: bool = False,
+    person_bboxes: list[tuple[float, float, float, float]] | None = None,
+    target_crop_height_ratio: float | None = None,
+    protected_crop_bbox: tuple[float, float, float, float] | None = None,
 ) -> Image.Image:
-    """Compose a model photo with proportional cover cropping and no borders."""
+    """Compose a model photo without borders, extending only clean side edges."""
     source = image.convert("RGB")
-    # Model outputs must always be edge-to-edge.  Do not retain the complete
-    # source with side extensions: even a background-only extension reads as a
-    # visible frame in a marketplace main image.
-    scale = max(size[0] / source.width, size[1] / source.height)
+    can_extend_background = (
+        size[0] == size[1]
+        and model_background_extension_safe(source, size, person_bboxes)
+    )
+    # A square crop of a 2:3 model source otherwise enlarges the person just
+    # to fill the width. Fit by the limiting dimension when clean side edges
+    # are available, then mirror those background-only edge strips.
+    direct_target_scale = size[0] == size[1] and target_crop_height_ratio
+    if direct_target_scale:
+        crop_ratio = max(0.20, min(1.0, float(target_crop_height_ratio)))
+        # Full-body shirt shots use a deliberate square crop from the head
+        # toward the hip. Calculate that crop directly instead of applying a
+        # cover-based adjustment to a contained photo, which made the person
+        # visibly too small in samples such as 03, 04, and 18.
+        scale = size[1] / (source.height * crop_ratio)
+        scale_adjustment = 0.0
+    else:
+        scale = (
+            min(size[0] / source.width, size[1] / source.height)
+            if can_extend_background
+            else max(size[0] / source.width, size[1] / source.height)
+        )
     # Full-body sources often need a deliberate 2× crop to turn a clothing
     # photo into a usable main image.  The composition assistant already
     # derives this from the detected body area, so do not silently cap it at
     # 25% here (that was why full-body images still looked almost unchanged).
     scale *= 1 + max(-10.0, min(200.0, scale_adjustment)) / 100
+    if protected_crop_bbox:
+        # A shoe composition may only zoom as far as the complete protected
+        # shoe region can still fit inside the target canvas.
+        protected_left, protected_top, protected_right, protected_bottom = (
+            max(0.0, min(float(value), float(limit)))
+            for value, limit in zip(
+                protected_crop_bbox,
+                (source.width, source.height, source.width, source.height),
+            )
+        )
+        protected_width = max(1.0, protected_right - protected_left)
+        protected_height = max(1.0, protected_bottom - protected_top)
+        maximum_safe_scale = min(
+            size[0] / protected_width,
+            size[1] / protected_height,
+        )
+        scale = min(scale, maximum_safe_scale)
     fitted = source.resize(
         (max(1, round(source.width * scale)), max(1, round(source.height * scale))),
         Image.Resampling.LANCZOS,
@@ -280,7 +442,42 @@ def resize_model_preserve(
     if fitted.width >= size[0] and fitted.height >= size[1]:
         left = round((fitted.width - size[0]) * position_x)
         top = round((fitted.height - size[1]) * position_y)
+        if protected_crop_bbox:
+            # Clamp the crop origin so every edge of the protected region is
+            # inside the output, even when the pose shifted the focus.
+            protected_left, protected_top, protected_right, protected_bottom = (
+                float(value) for value in protected_crop_bbox
+            )
+            left_min = max(0, round(protected_right * scale - size[0]))
+            left_max = min(fitted.width - size[0], round(protected_left * scale))
+            top_min = max(0, round(protected_bottom * scale - size[1]))
+            top_max = min(fitted.height - size[1], round(protected_top * scale))
+            left = max(left_min, min(left_max, left))
+            top = max(top_min, min(top_max, top))
         return fitted.crop((left, top, left + size[0], top + size[1]))
+    if can_extend_background:
+        if person_bboxes:
+            subject_center_x = (
+                min(float(box[0]) for box in person_bboxes)
+                + max(float(box[2]) for box in person_bboxes)
+            ) / 2.0
+            # The detector's position_x was calculated for cover cropping;
+            # reuse it here would shift the contained photo toward one side.
+            left = round(size[0] * 0.5 - subject_center_x * scale)
+        else:
+            left = round((size[0] - fitted.width) * position_x)
+        top = round((size[1] - fitted.height) * position_y)
+        fit_scale = max(0.0001, scale)
+        edge_strip_limit = max(1, round(source.width * 0.01))
+        edge_widths = (
+            max(1, round(min(left / fit_scale, edge_strip_limit, source.width))),
+            max(1, round(min(
+                (size[0] - left - fitted.width) / fit_scale,
+                edge_strip_limit,
+                source.width,
+            ))),
+        )
+        return mirror_side_fill(fitted, size, left, top, edge_widths)
     # Rounding can leave a one-pixel short side on unusual image ratios.
     return resize_cover(source, size)
 
@@ -674,6 +871,13 @@ def build_canvas(
             model_composition = {**model_composition, **by_size[size_key]}
         if model_composition.get("composition_mode") != "zoom_focus":
             model_composition = {**model_composition, "scale_adjustment_percent": 0.0}
+        raw_person_bboxes = model_composition.get("person_bboxes")
+        person_bboxes = (
+            [tuple(float(value) for value in box[:4]) for box in raw_person_bboxes]
+            if isinstance(raw_person_bboxes, list)
+            and all(isinstance(box, (list, tuple)) and len(box) >= 4 for box in raw_person_bboxes)
+            else None
+        )
         return resize_model_preserve(
             image,
             size,
@@ -681,6 +885,18 @@ def build_canvas(
             float(model_composition.get("position_x", 0.5)),
             float(model_composition.get("position_y", 0.5)),
             bool(model_composition.get("allow_mirror_extension", False)),
+            person_bboxes,
+            (
+                float(model_composition.get("target_crop_height_ratio"))
+                if model_composition.get("target_crop_height_ratio") is not None
+                else None
+            ),
+            (
+                tuple(float(value) for value in model_composition["protected_crop_bbox"][:4])
+                if isinstance(model_composition.get("protected_crop_bbox"), (list, tuple))
+                and len(model_composition["protected_crop_bbox"]) >= 4
+                else None
+            ),
         )
     if source_type in {"detail", "model_detail"}:
         # Detail material is intentionally edge-to-edge and bypasses product templates.
@@ -941,6 +1157,7 @@ def generate_selling_point_images(
     short_names: dict[Path, str] | None = None,
     short_group_names: dict[Path, str] | None = None,
     naming_mode: str = "original",
+    source_records: dict[Path, dict[str, object]] | None = None,
 ) -> int:
     """Assign configured selling points, using AI matches when available."""
     if not selling_points:
@@ -948,6 +1165,23 @@ def generate_selling_point_images(
     detail_sources = [source for source in sources if decisions.get(source, SourceTypeDecision("detail", 0, "", "")).source_type == "detail"]
     count = 0
     for index, source in enumerate(detail_sources):
+        record = source_records.get(source) if source_records is not None else None
+        if record is not None and record.get("reusable"):
+            reused_paths = [
+                Path(path)
+                for path in record.get("paths", [])
+                if isinstance(path, (str, Path))
+            ]
+            selling_paths = [path for path in reused_paths if "卖点图" in path.parts]
+            expected = sum(1 for size_name in selected_sizes if size_name in SIZES)
+            if expected and len(selling_paths) >= expected and all(path.is_file() for path in selling_paths):
+                if generated_paths is not None:
+                    generated_paths.update(selling_paths)
+                record["selling_point_images"] = len(selling_paths)
+                count += len(selling_paths)
+                if notify_progress:
+                    notify_progress(f"卖点图：{source.name}（复用）")
+                continue
         point = (selling_point_matches or {}).get(
             source, selling_points[index % len(selling_points)]
         )
@@ -971,6 +1205,9 @@ def generate_selling_point_images(
                 save_jpeg_with_limit(canvas, output_path, max_size_mb)
                 if generated_paths is not None:
                     generated_paths.add(output_path)
+                if record is not None:
+                    record.setdefault("paths", []).append(output_path)
+                    record["selling_point_images"] = int(record.get("selling_point_images", 0) or 0) + 1
                 if validation_issues is not None:
                     validation_issues.extend(validate_output(output_path, size, "RGB", max_size_mb))
                 count += 1
@@ -997,6 +1234,8 @@ def generate_transparent_products(
     short_names: dict[Path, str] | None = None,
     short_group_names: dict[Path, str] | None = None,
     naming_mode: str = "original",
+    source_records: dict[Path, dict[str, object]] | None = None,
+    allowed_source_paths: set[Path] | None = None,
 ) -> int:
     count = 0
     for color_dir in _material_dirs(product_root):
@@ -1012,7 +1251,24 @@ def generate_transparent_products(
         if not pngs:
             continue
         for png in pngs:
+            if allowed_source_paths is not None and png not in allowed_source_paths:
+                continue
             try:
+                record = source_records.get(png) if source_records is not None else None
+                if record is not None and record.get("reusable"):
+                    reused_paths = [
+                        Path(path)
+                        for path in record.get("paths", [])
+                        if isinstance(path, (str, Path))
+                    ]
+                    transparent_paths = [path for path in reused_paths if "透明产品图" in path.parts]
+                    if transparent_paths and all(path.is_file() for path in transparent_paths):
+                        if generated_paths is not None:
+                            generated_paths.update(transparent_paths)
+                        count += len(transparent_paths)
+                        if notify_progress:
+                            notify_progress(f"透明图：{png.name}（复用）")
+                        continue
                 analysis = analysis_cache.get(png) if analysis_cache is not None else None
                 if analysis is None:
                     analysis = analyze_source(png)
@@ -1040,6 +1296,9 @@ def generate_transparent_products(
                     save_png_with_limit(canvas, output_path, max_size_mb)
                     if generated_paths is not None:
                         generated_paths.add(output_path)
+                    if record is not None:
+                        record.setdefault("paths", []).append(output_path)
+                        record["transparent_images"] = int(record.get("transparent_images", 0) or 0) + 1
                     if validation_issues is not None:
                         validation_issues.extend(validate_output(output_path, size, "RGBA", max_size_mb))
                     count += 1
@@ -1070,18 +1329,130 @@ def cleanup_stale_transparent_products(
 
 
 MANIFEST_NAME = ".pixelflow-manifest.json"
+MANIFEST_TTL_DAYS = 7
+MANIFEST_CACHE_DIR_NAME = "PixelFlow/manifests"
 
 
 def _manifest_paths(output_root: Path) -> set[str]:
-    manifest_path = output_root / MANIFEST_NAME
+    payload = _read_manifest(output_root)
+    paths = payload.get("generated_paths", [])
+    return {str(path) for path in paths if isinstance(path, str)}
+
+
+def _manifest_cache_path(output_root: Path) -> Path:
+    """Return a private cache path keyed by the output folder location."""
+    resolved_root = output_root.expanduser().resolve(strict=False)
+    if sys.platform == "darwin":
+        cache_root = Path.home() / "Library" / "Caches"
+    else:
+        cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    key = hashlib.sha256(str(resolved_root).encode("utf-8")).hexdigest()
+    return cache_root / MANIFEST_CACHE_DIR_NAME / f"{key}.json"
+
+
+def _manifest_is_fresh(payload: dict[str, object]) -> bool:
+    generated_at = payload.get("generated_at")
+    try:
+        created = datetime.fromisoformat(str(generated_at))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        age_seconds = (datetime.now(timezone.utc) - created).total_seconds()
+    except (TypeError, ValueError):
+        # Preserve compatibility with older or manually edited manifests;
+        # parameter/version checks still decide whether they can be reused.
+        return True
+    return age_seconds <= MANIFEST_TTL_DAYS * 24 * 60 * 60
+
+
+def _read_manifest_file(manifest_path: Path) -> dict[str, object]:
     if not manifest_path.exists():
-        return set()
+        return {}
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        paths = payload.get("generated_paths", [])
-        return {str(path) for path in paths if isinstance(path, str)}
     except (OSError, ValueError, json.JSONDecodeError):
-        return set()
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _read_manifest(output_root: Path) -> dict[str, object]:
+    cache_path = _manifest_cache_path(output_root)
+    payload = _read_manifest_file(cache_path)
+    if payload and not _manifest_is_fresh(payload):
+        try:
+            cache_path.unlink()
+        except OSError:
+            pass
+        return {}
+    if payload:
+        return payload
+
+    # Migrate manifests created by older builds. The output folder remains
+    # clean after this read, while existing incremental records are preserved.
+    legacy_path = output_root / MANIFEST_NAME
+    legacy_payload = _read_manifest_file(legacy_path)
+    if not legacy_payload:
+        return {}
+    if not _manifest_is_fresh(legacy_payload):
+        try:
+            legacy_path.unlink()
+        except OSError:
+            pass
+        return {}
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            json.dumps(legacy_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        legacy_path.unlink()
+    except OSError:
+        # Read-only/shared output folders can still be used; just leave the
+        # legacy file in place when migration is not permitted.
+        pass
+    return legacy_payload
+
+
+def _source_signatures(product_root: Path, sources: list[Path]) -> dict[str, dict[str, int]]:
+    signatures: dict[str, dict[str, int]] = {}
+    for source in sources:
+        try:
+            stat = source.stat()
+        except OSError:
+            continue
+        signatures[source.relative_to(product_root).as_posix()] = {
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+    return signatures
+
+
+def _manifest_matches(
+    output_root: Path,
+    parameters: dict[str, object],
+    source_signatures: dict[str, dict[str, int]],
+) -> dict[str, object] | None:
+    """Return a manifest when all inputs and settings still match the last run."""
+    payload = _read_manifest(output_root)
+    if not payload:
+        return None
+    if payload.get("parameters") != parameters:
+        return None
+    if payload.get("source_signatures") != source_signatures:
+        return None
+    paths = payload.get("generated_paths", [])
+    if not isinstance(paths, list) or not paths:
+        return None
+    for relative in paths:
+        if not isinstance(relative, str):
+            return None
+        candidate = output_root / relative
+        try:
+            candidate.relative_to(output_root)
+        except ValueError:
+            return None
+        if not candidate.is_file():
+            return None
+    return payload
 
 
 def _write_manifest(
@@ -1089,17 +1460,31 @@ def _write_manifest(
     generated_paths: set[Path],
     parameters: dict[str, object],
     source_mappings: list[dict[str, str]] | None = None,
+    source_signatures: dict[str, dict[str, int]] | None = None,
+    result_summary: dict[str, int] | None = None,
+    source_records: dict[str, dict[str, object]] | None = None,
 ) -> None:
     payload = {
-        "pixel_flow_version": "stable-12",
+        "pixel_flow_version": ENGINE_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "parameters": parameters,
         "generated_paths": sorted(path.relative_to(output_root).as_posix() for path in generated_paths),
         "source_mappings": source_mappings or [],
+        "source_signatures": source_signatures or {},
+        "result_summary": result_summary or {},
+        "source_records": source_records or {},
     }
-    (output_root / MANIFEST_NAME).write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    manifest_path = _manifest_cache_path(output_root)
+    try:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError:
+        # Manifest is an optional performance cache; a cache-directory
+        # permission problem must not turn a completed generation into a
+        # failed task.
+        pass
 
 
 def _cleanup_manifest_outputs(output_root: Path, generated_paths: set[Path]) -> int:
@@ -1135,6 +1520,8 @@ def generate_vip_square_images(
     generated_paths: set[Path] | None = None,
     validation_issues: list[ValidationIssue] | None = None,
     failures: list[dict[str, str]] | None = None,
+    reusable_paths: set[Path] | None = None,
+    source_records: dict[Path, dict[str, object]] | None = None,
 ) -> int:
     if not border_path.exists():
         raise FileNotFoundError(f"唯品会边框不存在：{border_path}")
@@ -1157,17 +1544,39 @@ def generate_vip_square_images(
                         image = opened.convert("RGBA")
                     image = Image.alpha_composite(image, border)
                     output_path = output_dir / source.name
+                    if reusable_paths is not None and output_path in reusable_paths:
+                        if generated_paths is not None:
+                            generated_paths.add(output_path)
+                        count += 1
+                        if notify_progress:
+                            notify_progress(f"唯品图：{output_path.name}（复用）")
+                        continue
                     save_jpeg_with_limit(image.convert("RGB"), output_path, max_size_mb)
                     if generated_paths is not None:
                         generated_paths.add(output_path)
                     if validation_issues is not None:
                         validation_issues.extend(validate_output(output_path, (1440, 1440), "RGB", max_size_mb))
+                    if source_records is not None:
+                        for record in source_records.values():
+                            if source in record.get("paths", []):
+                                record["paths"].append(output_path)
+                                record["vip_images"] = int(record.get("vip_images", 0) or 0) + 1
+                                break
                     count += 1
                     if notify_progress:
                         notify_progress(f"唯品图：{output_path.name}")
                 except Exception as error:  # noqa: BLE001 - keep the remaining sources running
                     if failures is not None:
-                        failures.append({"source": str(source), "code": "vip_output_failed", "message": str(error)})
+                        retry_source = None
+                        if source_records is not None:
+                            for original, record in source_records.items():
+                                if source in record.get("paths", []):
+                                    retry_source = str(original)
+                                    break
+                        failure = {"source": str(source), "code": "vip_output_failed", "message": str(error)}
+                        if retry_source:
+                            failure["retry_source"] = retry_source
+                        failures.append(failure)
     return count
 
 
@@ -1200,6 +1609,7 @@ def generate_images(
     naming_mode: str = "short",
     local_model_enabled: bool = False,
     local_model_path: str | Path | None = None,
+    source_filter: set[str] | None = None,
 ) -> dict[str, object]:
     logo_paths = {
         "logo": resource_root / "新logo 1440.png",
@@ -1229,16 +1639,33 @@ def generate_images(
     white_logo = Image.open(logo_paths["white_logo"]).convert("RGBA") if include_logo else None
     tall_logo = Image.open(logo_paths["tall_logo"]).convert("RGBA") if include_logo else None
     tall_white_logo = Image.open(logo_paths["tall_white_logo"]).convert("RGBA") if include_logo else None
-    sources = sorted(
+    all_sources = sorted(
         path
         for color_dir in material_dirs
         for path in sorted(color_dir.iterdir())
         if path.suffix.lower() in IMAGE_EXTENSIONS
     )
+    source_filter = source_filter or None
+
+    def matches_source_filter(source: Path) -> bool:
+        # Retry filters represent concrete input files.  Do not fall back to
+        # basename matching here: duplicate names in different color folders
+        # must not cause more than the requested item to be regenerated.
+        return source_filter is None or any(
+            key in source_filter for key in (str(source), source.as_posix())
+        )
+
+    sources = [
+        source
+        for source in all_sources
+        if matches_source_filter(source)
+    ]
     if not sources:
         raise ValueError("素材文件夹内没有 JPG、JPEG 或 PNG 图片")
     naming_mode = naming_mode if naming_mode in {"short", "original"} else "short"
-    short_names, short_group_names = _build_short_source_names(sources, product_root)
+    # Build names from the complete input set so a retry-only run produces
+    # exactly the same output paths as the original batch.
+    short_names, short_group_names = _build_short_source_names(all_sources, product_root)
     source_mappings = [
         {
             "short_name": short_names[source],
@@ -1272,6 +1699,100 @@ def generate_images(
     model_product_category = (
         category_decision.category if category_decision is not None else category_override
     )
+    manifest_parameters: dict[str, object] = {
+        "engine_version": ENGINE_VERSION,
+        "selected_sizes": list(selected_sizes),
+        "include_logo": include_logo,
+        "include_vip": include_vip,
+        "include_model_images": include_model_images,
+        "include_selling_point_images": include_selling_point_images,
+        "selling_points": list(selling_points),
+        "max_size_mb": max_size_mb,
+        "category": category_decision.category if category_decision is not None else None,
+        "naming_mode": naming_mode,
+        "local_model_enabled": local_model_enabled,
+        "local_model_path": str(local_model_path or ""),
+        "source_type_overrides": source_type_overrides or {},
+        "excluded_model_sources": sorted(excluded_model_sources or set()),
+        "source_scale_adjustments": source_scale_adjustments or {},
+        "folder_category_overrides": folder_category_overrides or {},
+        "logo_overrides": {
+            key: str(value) for key, value in (logo_overrides or {}).items()
+        },
+    }
+    source_signatures = _source_signatures(product_root, sources)
+    previous_manifest = _read_manifest(output_root)
+    previous_records_raw = previous_manifest.get("source_records", {})
+    reusable_records: dict[Path, dict[str, object]] = {}
+    if (
+        source_filter is None
+        and not ai_assist
+        and previous_manifest.get("parameters") == manifest_parameters
+        and isinstance(previous_records_raw, dict)
+    ):
+        for source in sources:
+            relative = source.relative_to(product_root).as_posix()
+            raw_record = previous_records_raw.get(relative)
+            if not isinstance(raw_record, dict):
+                continue
+            if raw_record.get("signature") != source_signatures.get(relative):
+                continue
+            raw_paths = raw_record.get("paths", [])
+            if not isinstance(raw_paths, list) or not raw_paths:
+                continue
+            paths: list[Path] = []
+            valid = True
+            for raw_path in raw_paths:
+                if not isinstance(raw_path, str):
+                    valid = False
+                    break
+                candidate = output_root / raw_path
+                try:
+                    candidate.relative_to(output_root)
+                except ValueError:
+                    valid = False
+                    break
+                if not candidate.is_file():
+                    valid = False
+                    break
+                paths.append(candidate)
+            if valid:
+                reusable_records[source] = {
+                    **raw_record,
+                    "paths": paths,
+                    "reusable": True,
+                }
+    # AI-assisted classification can legitimately vary between runs, so do
+    # not reuse a previous batch when the remote assistant is enabled.
+    if not ai_assist and source_filter is None:
+        cached_manifest = _manifest_matches(
+            output_root,
+            manifest_parameters,
+            source_signatures,
+        )
+        if cached_manifest is not None:
+            summary = cached_manifest.get("result_summary")
+            summary = summary if isinstance(summary, dict) else {}
+            return {
+                "sources": len(sources),
+                "main_images": int(summary.get("main_images", 0) or 0),
+                "model_images": int(summary.get("model_images", 0) or 0),
+                "selling_point_images": int(summary.get("selling_point_images", 0) or 0),
+                "transparent_images": int(summary.get("transparent_images", 0) or 0),
+                "vip_images": int(summary.get("vip_images", 0) or 0),
+                "render_workers": int(summary.get("render_workers", 1) or 1),
+                "local_model_used": bool(summary.get("local_model_used", False)),
+                "local_model_errors": [],
+                "cancelled": False,
+                "incremental_skipped": True,
+                "stale_outputs_removed": 0,
+                "failures": [],
+                "validation": {"passed": len(cached_manifest.get("generated_paths", [])), "warnings": [], "failed": []},
+                "category": manifest_parameters.get("category"),
+                "category_source": "manifest",
+                "category_confidence": 1.0,
+                "output_root": str(output_root),
+            }
     render_rules = load_render_rules(resource_root)
 
     source_type_decisions: dict[Path, SourceTypeDecision] = {}
@@ -1315,10 +1836,74 @@ def generate_images(
             except Exception as error:  # noqa: BLE001 - model is an optional enhancement
                 local_model_errors.append(f"本地模型加载失败：{error}")
 
+    # The confirmation dialog may have already used the pose model to correct
+    # a saturated-background photo, but generation classifies the sources
+    # independently.  Apply the same correction here or the worker would
+    # silently turn those model photos back into detail images.
+    if local_model_assistant is not None:
+        for source in sources:
+            override_value = next(
+                (
+                    (source_type_overrides or {}).get(key)
+                    for key in (str(source), source.name, source.as_posix())
+                    if (source_type_overrides or {}).get(key)
+                ),
+                None,
+            )
+            if override_value in {"detail", "model_detail"}:
+                continue
+            try:
+                composition = local_model_assistant.compose_for_sizes(
+                    source,
+                    SIZES,
+                    product_category=model_product_category,
+                )
+                model_view = composition.get("model_view")
+                confidence = float(composition.get("confidence", 0.0))
+                rule_decision = source_type_decisions[source]
+                can_promote_model = (
+                    rule_decision.source_type in {"model", "model_detail"}
+                    or model_view == "group"
+                )
+                credible_model = credible_model_composition(composition)
+                if model_view in {"full_body", "upper_body", "lower_body", "group"} and can_promote_model and credible_model:
+                    source_type_decisions[source] = SourceTypeDecision(
+                        "model",
+                        confidence,
+                        "local_onnx",
+                        "本地模型检测到人物主体"
+                        + ("（多人）" if model_view == "group" else ""),
+                        metadata=composition,
+                    )
+                elif source_type_decisions[source].source_type == "model" and credible_model:
+                    source_type_decisions[source] = SourceTypeDecision(
+                        "model_detail",
+                        confidence,
+                        "local_onnx",
+                        "本地模型识别为模特细节图，按细节图铺满处理",
+                        metadata=composition,
+                    )
+                elif (
+                    source_type_decisions[source].source_type in {"model", "model_detail"}
+                    and source_type_decisions[source].source != "manual"
+                    and not credible_model
+                ):
+                    source_type_decisions[source] = SourceTypeDecision(
+                        "detail",
+                        confidence,
+                        "local_onnx",
+                        "人体关键点/人物范围不足，按细节图处理",
+                        metadata=composition,
+                    )
+            except Exception as error:  # noqa: BLE001 - preserve rule fallback
+                local_model_errors.append(f"{source.name}：模型识别失败，已回退规则分类：{error}")
+
     transparent_sources: list[Path] = []
     failures: list[dict[str, str]] = []
     for color_dir in material_dirs:
         for candidate in sorted(color_dir.glob("*.png")):
+            if not matches_source_filter(candidate):
+                continue
             try:
                 with Image.open(candidate) as image:
                     if has_transparency(image):
@@ -1439,6 +2024,7 @@ def generate_images(
     vip_source_paths: set[Path] = set()
     analysis_cache: dict[Path, SourceAnalysis] = {}
     selling_point_matches: dict[Path, str] = {}
+    source_records_by_path: dict[Path, dict[str, object]] = {}
 
     if ai_provider is not None and include_selling_point_images and selling_points:
         for source in sources:
@@ -1452,6 +2038,33 @@ def generate_images(
 
     def render_source(source: Path) -> dict[str, object]:
         """Render one source independently so several sources can run safely."""
+        reusable_record = reusable_records.get(source)
+        if reusable_record is not None:
+            # Manifest paths are serialized as strings; normalize them back to
+            # Path objects before inspecting or returning them.
+            paths = {
+                path
+                for raw_path in reusable_record.get("paths", [])
+                if isinstance(raw_path, (str, Path))
+                for raw in [Path(raw_path)]
+                for path in [raw if raw.is_absolute() else output_root / raw]
+            }
+            for path in sorted(paths):
+                if "透明产品图" not in path.parts and "唯品专享1440" not in path.parts and "卖点图" not in path.parts:
+                    report(f"主图：{path.name}（复用）")
+            return {
+                "analysis": None,
+                "paths": paths,
+                "validation": [],
+                "vip_paths": {
+                    path for path in paths
+                    if path.name.lower().endswith(".jpg") and "/1440x1440/无Logo/" in f"/{path.as_posix()}"
+                },
+                "failures": [],
+                "main_count": int(reusable_record.get("main_images", 0) or 0),
+                "model_count": int(reusable_record.get("model_images", 0) or 0),
+                "record": reusable_record,
+            }
         local_paths: set[Path] = set()
         local_validation: list[ValidationIssue] = []
         local_vip_paths: set[Path] = set()
@@ -1469,6 +2082,7 @@ def generate_images(
                     "failures": local_failures,
                     "main_count": 0,
                     "model_count": 0,
+                    "record": {"paths": [], "main_images": 0, "model_images": 0, "transparent_images": 0, "vip_images": 0, "selling_point_images": 0},
                 }
             analysis = analyze_source(source)
             source_decision = source_type_decisions.get(source)
@@ -1483,6 +2097,7 @@ def generate_images(
                     "failures": local_failures,
                     "main_count": 0,
                     "model_count": 0,
+                    "record": {"paths": [], "main_images": 0, "model_images": 0, "transparent_images": 0, "vip_images": 0, "selling_point_images": 0},
                 }
             color_name = source.parent.name
             output_group_name = (
@@ -1499,6 +2114,7 @@ def generate_images(
                     "failures": local_failures,
                     "main_count": 0,
                     "model_count": 0,
+                    "record": {"paths": [], "main_images": 0, "model_images": 0, "transparent_images": 0, "vip_images": 0, "selling_point_images": 0},
                 }
             adjustment = float(_source_mapping_value(source, source_scale_adjustments, 0.0))
             adjustment = max(-50.0, min(50.0, adjustment))
@@ -1566,7 +2182,12 @@ def generate_images(
                             output_dir /= output_group_name
                         output_dir = output_dir / size_name / logo_state
                     else:
-                        output_dir = output_root / output_group_name / size_name / logo_state
+                        # A model-root batch can contain a close-up that the
+                        # pose model safely downgrades to ``detail``. Keep it
+                        # with the model batch instead of creating a stray
+                        # output_root/素材 folder.
+                        model_root = color_name.casefold() in MODEL_GROUP_NAMES
+                        output_dir = output_root / ("模特图" if model_root else output_group_name) / size_name / logo_state
                     output_dir.mkdir(parents=True, exist_ok=True)
                     output_path = output_dir / f"{_source_output_stem(source, short_names, naming_mode)}.jpg"
                     save_jpeg_with_limit(canvas.convert("RGB"), output_path, max_size_mb)
@@ -1575,6 +2196,7 @@ def generate_images(
                     if size_name == "1440x1440" and logo_state == "无Logo":
                         local_vip_paths.add(output_path)
                     local_main_count += 1
+                    # Keep a per-input output index for future incremental runs.
                     if source_decision is not None and source_decision.source_type in {"model", "model_detail"}:
                         local_model_count += 1
                     report(f"主图：{output_path.name}")
@@ -1588,6 +2210,14 @@ def generate_images(
             "failures": local_failures,
             "main_count": local_main_count,
             "model_count": local_model_count,
+            "record": {
+                "paths": list(local_paths),
+                "main_images": local_main_count,
+                "model_images": local_model_count,
+                "transparent_images": 0,
+                "vip_images": 0,
+                "selling_point_images": 0,
+            },
         }
 
     main_count = 0
@@ -1611,7 +2241,24 @@ def generate_images(
             failures.extend(result["failures"])
             main_count += int(result["main_count"])
             model_count += int(result["model_count"])
+            source_records_by_path[source] = dict(result.get("record", {}))
     cancelled = bool(cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)())
+
+    # Keep a record slot for sources that do not produce a main/model image
+    # (for example an excluded model photo) but may still produce a transparent
+    # product image.  This lets the next incremental run reuse that output too.
+    for source in sources:
+        source_records_by_path.setdefault(
+            source,
+            {
+                "paths": [],
+                "main_images": 0,
+                "model_images": 0,
+                "transparent_images": 0,
+                "vip_images": 0,
+                "selling_point_images": 0,
+            },
+        )
 
     transparent_count = 0
     vip_count = 0
@@ -1632,6 +2279,8 @@ def generate_images(
             short_names,
             short_group_names,
             naming_mode,
+            source_records_by_path,
+            set(sources),
         )
         vip_count = (
             generate_vip_square_images(
@@ -1643,6 +2292,13 @@ def generate_images(
                 generated_paths,
                 validation_issues,
                 failures,
+                {
+                    path
+                    for record in reusable_records.values()
+                    for path in record.get("paths", [])
+                    if isinstance(path, Path) and "唯品专享1440" in path.parts
+                },
+                source_records_by_path,
             )
             if include_vip and "1440x1440" in selected_sizes
             else 0
@@ -1663,25 +2319,46 @@ def generate_images(
                 short_names,
                 short_group_names,
                 naming_mode,
+                source_records_by_path,
             )
     stale_removed = 0
-    if not cancelled and not failures:
+    if not cancelled and not failures and source_filter is None:
         stale_removed = _cleanup_manifest_outputs(output_root, generated_paths)
+        serialized_source_records: dict[str, dict[str, object]] = {}
+        for source, record in source_records_by_path.items():
+            relative = source.relative_to(product_root).as_posix()
+            serialized_source_records[relative] = {
+                "signature": source_signatures.get(relative),
+                "paths": sorted(
+                    path.relative_to(output_root).as_posix()
+                    for path in record.get("paths", [])
+                    if isinstance(path, Path)
+                    and path.exists()
+                    and path.is_relative_to(output_root)
+                ),
+                "main_images": int(record.get("main_images", 0) or 0),
+                "model_images": int(record.get("model_images", 0) or 0),
+                "transparent_images": int(record.get("transparent_images", 0) or 0),
+                "vip_images": int(record.get("vip_images", 0) or 0),
+                "selling_point_images": int(record.get("selling_point_images", 0) or 0),
+            }
+        result_summary = {
+            "main_images": main_count,
+            "model_images": model_count,
+            "selling_point_images": selling_point_count,
+            "transparent_images": transparent_count,
+            "vip_images": vip_count,
+            "render_workers": worker_count,
+            "local_model_used": int(local_model_assistant is not None),
+        }
         _write_manifest(
             output_root,
             generated_paths,
-            {
-                "selected_sizes": selected_sizes,
-                "include_logo": include_logo,
-                "include_vip": include_vip,
-                "include_model_images": include_model_images,
-                "include_selling_point_images": include_selling_point_images,
-                "selling_points": selling_points,
-                "category": category_decision.category if category_decision is not None else None,
-                "naming_mode": naming_mode,
-                "local_model_enabled": local_model_enabled,
-            },
+            manifest_parameters,
             source_mappings,
+            source_signatures,
+            result_summary,
+            serialized_source_records,
         )
     result: dict[str, object] = {
         "sources": len(sources),
@@ -1697,6 +2374,8 @@ def generate_images(
         "local_model_used": local_model_assistant is not None,
         "local_model_errors": local_model_errors,
         "cancelled": cancelled,
+        "retried_only": source_filter is not None,
+        "incremental_reused": len(reusable_records) if source_filter is None else 0,
         "stale_outputs_removed": stale_removed,
         "failures": failures,
         "validation": {

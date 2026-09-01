@@ -27,7 +27,8 @@ export PYINSTALLER_CONFIG_DIR="$PWD/.pyinstaller-cache-catalina-x64"
   --target-arch x86_64 \
   --icon "$PWD/resources/app-icon.icns" \
   --add-data "$PWD/resources:resources" \
-  --exclude-module onnxruntime \
+  --hidden-import onnxruntime \
+  --collect-binaries onnxruntime \
   --exclude-module PySide6.QtNetwork \
   --exclude-module PySide6.QtOpenGL \
   --exclude-module PySide6.QtOpenGLWidgets \

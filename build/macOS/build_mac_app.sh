@@ -37,7 +37,6 @@ mkdir -p "$SPEC_OUTPUT_DIR"
   --exclude-module PySide6.QtQuick \
   --exclude-module PySide6.QtQuickControls2 \
   --exclude-module PySide6.QtQuickWidgets \
-  --exclude-module PySide6.QtSvg \
   --exclude-module PySide6.QtSvgWidgets \
   --exclude-module PySide6.QtMultimedia \
   --exclude-module PySide6.QtMultimediaWidgets \
