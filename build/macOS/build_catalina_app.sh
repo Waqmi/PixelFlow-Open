@@ -18,6 +18,10 @@ fi
 APP_NAME="${APP_NAME:-PixelFlow-macOS-catalina-x64}"
 export MACOSX_DEPLOYMENT_TARGET=10.15
 export PYINSTALLER_CONFIG_DIR="$PWD/.pyinstaller-cache-catalina-x64"
+MODEL_DATA_ARGS=()
+if [[ -n "${CATALINA_MODEL_SOURCE:-}" && -f "$CATALINA_MODEL_SOURCE" ]]; then
+  MODEL_DATA_ARGS=(--add-data "${CATALINA_MODEL_SOURCE}:resources/models")
+fi
 
 "$PYTHON_BIN" -m PyInstaller \
   --noconfirm \
@@ -27,6 +31,7 @@ export PYINSTALLER_CONFIG_DIR="$PWD/.pyinstaller-cache-catalina-x64"
   --target-arch x86_64 \
   --icon "$PWD/resources/app-icon.icns" \
   --add-data "$PWD/resources:resources" \
+  "${MODEL_DATA_ARGS[@]}" \
   --hidden-import onnxruntime \
   --collect-binaries onnxruntime \
   --exclude-module PySide6.QtNetwork \

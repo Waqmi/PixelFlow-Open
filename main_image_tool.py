@@ -98,7 +98,7 @@ from local_model_assistant import (
     LocalModelAssistant,
     category_compatibility,
     credible_model_composition,
-    find_onnx_model,
+    find_compatible_onnx_model,
 )
 
 
@@ -826,7 +826,10 @@ class _LegacyV15SettingsDialog(QDialog):
 
     def _refresh_model_status(self) -> None:
         path = Path(self.local_model_path.text().strip())
-        available, message = LocalModelAssistant.inspect(path)
+        available, message = LocalModelAssistant.inspect(
+            path,
+            RESOURCE_ROOT / "models",
+        )
         self.local_model_status.setText(f"状态：{message}")
 
     def _test_model(self) -> None:
@@ -2585,7 +2588,10 @@ class MainImageTool(QWidget):
         # while retaining the model-source behaviour (including Skip).
         local_model = None
         if local_model_enabled:
-            model_path = find_onnx_model(local_model_path)
+            model_path = find_compatible_onnx_model(
+                local_model_path,
+                RESOURCE_ROOT / "models",
+            )
             if model_path is not None:
                 try:
                     local_model = LocalModelAssistant(model_path)

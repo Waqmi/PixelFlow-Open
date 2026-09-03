@@ -185,6 +185,36 @@ def find_onnx_model(model_dir: str | Path) -> Path | None:
     return models[0] if models else None
 
 
+def find_compatible_onnx_model(
+    model_dir: str | Path,
+    fallback_model_dir: str | Path | None = None,
+) -> Path | None:
+    """Return the first loadable model, optionally using a bundled fallback."""
+    candidates: list[Path] = []
+    for directory in (model_dir, fallback_model_dir):
+        if not directory:
+            continue
+        path = Path(directory).expanduser()
+        if not path.is_dir():
+            continue
+        for candidate in sorted(path.glob("*.onnx")):
+            if candidate not in candidates:
+                candidates.append(candidate)
+    if not candidates:
+        return None
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        return None
+    for candidate in candidates:
+        try:
+            ort.InferenceSession(str(candidate), providers=["CPUExecutionProvider"])
+        except Exception:  # noqa: BLE001 - try the next compatible candidate
+            continue
+        return candidate
+    return None
+
+
 class LocalModelAssistant:
     """Run a YOLO-style ONNX model when the optional runtime is available.
 
@@ -217,10 +247,13 @@ class LocalModelAssistant:
         return int(value) if isinstance(value, int) and value > 0 else fallback
 
     @staticmethod
-    def inspect(model_dir: str | Path) -> tuple[bool, str]:
-        model_path = find_onnx_model(model_dir)
+    def inspect(
+        model_dir: str | Path,
+        fallback_model_dir: str | Path | None = None,
+    ) -> tuple[bool, str]:
+        model_path = find_compatible_onnx_model(model_dir, fallback_model_dir)
         if model_path is None:
-            return False, "未检测到 ONNX 模型文件"
+            return False, "未检测到可加载的 ONNX 模型文件"
         try:
             LocalModelAssistant(model_path)
         except Exception as error:  # noqa: BLE001 - surface a friendly settings status

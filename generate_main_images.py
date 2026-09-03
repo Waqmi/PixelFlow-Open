@@ -22,7 +22,7 @@ from output_validator import ValidationIssue, validate_output
 from local_model_assistant import (
     LocalModelAssistant,
     credible_model_composition,
-    find_onnx_model,
+    find_compatible_onnx_model,
 )
 
 from category_engine import (
@@ -1827,7 +1827,10 @@ def generate_images(
     local_model_assistant: LocalModelAssistant | None = None
     local_model_errors: list[str] = []
     if local_model_enabled:
-        model_path = find_onnx_model(local_model_path or "")
+        model_path = find_compatible_onnx_model(
+            local_model_path or "",
+            RESOURCE_ROOT / "models",
+        )
         if model_path is None:
             local_model_errors.append("未找到 ONNX 模型文件，已回退规则构图")
         else:
